@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from yggdrasil.domain.artifacts import ArtifactRef, normalize_artifacts
 from yggdrasil.domain.enums import IndexState, StepKind, TrajectoryStatus
 from yggdrasil.domain.models import EffortLedger, Outcome, Progress, RuntimeFingerprint, Step, Trajectory
 from yggdrasil.ports.store import (
@@ -74,6 +75,7 @@ class SessionService:
         tags: list[str] | None = None,
         runtime_fingerprint: RuntimeFingerprint | dict[str, Any] | None = None,
         external_refs: dict[str, Any] | None = None,
+        artifacts: list[ArtifactRef] | list[dict[str, Any]] | None = None,
         progress: Progress | dict[str, Any] | None = None,
         effort: EffortLedger | dict[str, Any] | None = None,
         embed_view_version: str = "coding_v1",
@@ -104,6 +106,7 @@ class SessionService:
                     runtime_fingerprint=fp,
                     tags=list(tags or []),
                     external_refs=dict(external_refs or {}),
+                    artifacts=normalize_artifacts(artifacts),
                     progress=prog,
                     effort=eff,
                     embed_view_version=embed_view_version,
@@ -227,10 +230,13 @@ class SessionService:
         scaffold_text: str | None = None,
         runtime_fingerprint: RuntimeFingerprint | dict[str, Any] | None = None,
         external_refs: dict[str, Any] | None = None,
+        artifacts: list[ArtifactRef] | list[dict[str, Any]] | None = None,
+        merge_artifacts: bool = True,
     ) -> Trajectory:
         fp = runtime_fingerprint
         if isinstance(fp, dict):
             fp = RuntimeFingerprint.model_validate(fp)
+        arts = normalize_artifacts(artifacts) if artifacts is not None else None
         try:
             traj = self._store.update_meta(
                 UpdateTrajectoryMetaInput(
@@ -240,6 +246,8 @@ class SessionService:
                     scaffold_text=scaffold_text,
                     runtime_fingerprint=fp,
                     external_refs=external_refs,
+                    artifacts=arts,
+                    merge_artifacts=merge_artifacts,
                 )
             )
         except Exception as exc:

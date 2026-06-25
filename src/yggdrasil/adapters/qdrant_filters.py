@@ -113,6 +113,19 @@ def compile_search_filter(
     if query.tags_any:
         must.append(qm.FieldCondition(key="tags", match=qm.MatchAny(any=list(query.tags_any))))
 
+    if query.owner:
+        must.append(_field_condition("owner", qm.MatchValue(value=query.owner)))
+    if query.agent_id:
+        must.append(_field_condition("agent_id", qm.MatchValue(value=query.agent_id)))
+    if query.team:
+        must.append(_field_condition("team", qm.MatchValue(value=query.team)))
+    if query.workspace:
+        must.append(_field_condition("workspace", qm.MatchValue(value=query.workspace)))
+    if query.require_artifacts is True:
+        must.append(_field_condition("has_artifacts", qm.MatchValue(value=True)))
+    if query.experience_grade_only is True:
+        must.append(_field_condition("experience_grade", qm.MatchValue(value=True)))
+
     for key, value in (query.runtime_filters or {}).items():
         if key not in RUNTIME_FILTER_FIELDS:
             continue

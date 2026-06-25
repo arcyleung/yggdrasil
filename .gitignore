@@ -37,3 +37,5 @@ data/
 # Test / tmp
 tmp/
 .temp/
+
+user_mapping.yaml

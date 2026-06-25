@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+from yggdrasil.domain.artifacts import ArtifactRef, artifacts_from_step_payload, merge_artifacts
 from yggdrasil.domain.effort import is_terminal_status, is_writable_status, merge_effort_ledgers
 from yggdrasil.domain.enums import IndexState, TrajectoryStatus
 from yggdrasil.domain.models import (
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS trajectories (
     runtime_fingerprint_json TEXT,
     tags_json TEXT NOT NULL DEFAULT '[]',
     external_refs_json TEXT NOT NULL DEFAULT '{}',
+    artifacts_json TEXT NOT NULL DEFAULT '[]',
     progress_json TEXT NOT NULL DEFAULT '{}',
     outcome_json TEXT,
     effort_json TEXT NOT NULL DEFAULT '{}',
@@ -117,7 +119,15 @@ class SqliteTrajectoryStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(SCHEMA_SQL)
+        self._migrate_schema()
         self._conn.commit()
+
+    def _migrate_schema(self) -> None:
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(trajectories)").fetchall()}
+        if "artifacts_json" not in cols:
+            self._conn.execute(
+                "ALTER TABLE trajectories ADD COLUMN artifacts_json TEXT NOT NULL DEFAULT '[]'"
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -129,6 +139,11 @@ class SqliteTrajectoryStore:
         effort_raw = _json_loads(row["effort_json"], {})
         tags_raw = _json_loads(row["tags_json"], [])
         external_refs_raw = _json_loads(row["external_refs_json"], {})
+        try:
+            artifacts_raw = _json_loads(row["artifacts_json"], [])
+        except (KeyError, IndexError):
+            artifacts_raw = []
+        artifacts = [ArtifactRef.model_validate(a) for a in (artifacts_raw or [])]
         return Trajectory(
             id=row["id"],
             domain=row["domain"],
@@ -138,6 +153,7 @@ class SqliteTrajectoryStore:
             runtime_fingerprint=RuntimeFingerprint.model_validate(runtime_raw) if runtime_raw else None,
             tags=list(tags_raw or []),
             external_refs=dict(external_refs_raw or {}),
+            artifacts=artifacts,
             progress=Progress.model_validate(progress_raw or {}),
             outcome=Outcome.model_validate(outcome_raw) if outcome_raw else None,
             effort=EffortLedger.model_validate(effort_raw or {}),
@@ -167,10 +183,10 @@ class SqliteTrajectoryStore:
             """
             INSERT INTO trajectories (
                 id, domain, status, task_text, scaffold_text,
-                runtime_fingerprint_json, tags_json, external_refs_json,
+                runtime_fingerprint_json, tags_json, external_refs_json, artifacts_json,
                 progress_json, outcome_json, effort_json,
                 embed_view_version, index_state, created_at, updated_at, finalized_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 traj.id,
@@ -181,6 +197,7 @@ class SqliteTrajectoryStore:
                 _json_dumps(traj.runtime_fingerprint) if traj.runtime_fingerprint else None,
                 _json_dumps(traj.tags),
                 _json_dumps(traj.external_refs),
+                _json_dumps([a.model_dump(mode="json") for a in traj.artifacts]),
                 _json_dumps(traj.progress),
                 _json_dumps(traj.outcome) if traj.outcome else None,
                 _json_dumps(traj.effort),
@@ -198,6 +215,7 @@ class SqliteTrajectoryStore:
             UPDATE trajectories SET
                 domain = ?, status = ?, task_text = ?, scaffold_text = ?,
                 runtime_fingerprint_json = ?, tags_json = ?, external_refs_json = ?,
+                artifacts_json = ?,
                 progress_json = ?, outcome_json = ?, effort_json = ?,
                 embed_view_version = ?, index_state = ?, updated_at = ?, finalized_at = ?
             WHERE id = ?
@@ -210,6 +228,7 @@ class SqliteTrajectoryStore:
                 _json_dumps(traj.runtime_fingerprint) if traj.runtime_fingerprint else None,
                 _json_dumps(traj.tags),
                 _json_dumps(traj.external_refs),
+                _json_dumps([a.model_dump(mode="json") for a in traj.artifacts]),
                 _json_dumps(traj.progress),
                 _json_dumps(traj.outcome) if traj.outcome else None,
                 _json_dumps(traj.effort),
@@ -252,6 +271,7 @@ class SqliteTrajectoryStore:
             runtime_fingerprint=data.runtime_fingerprint,
             tags=list(data.tags),
             external_refs=dict(data.external_refs),
+            artifacts=list(data.artifacts or []),
             progress=progress,
             outcome=None,
             effort=effort,
@@ -348,6 +368,11 @@ class SqliteTrajectoryStore:
         if data.mark_partial:
             traj = traj.model_copy(update={"status": TrajectoryStatus.PARTIAL})
 
+        # Harvest artifact refs from step payloads (skill contract)
+        step_arts = artifacts_from_step_payload(step.payload, step_seq=step.seq)
+        if step_arts:
+            traj = traj.model_copy(update={"artifacts": merge_artifacts(traj.artifacts, step_arts)})
+
         progress = traj.progress
         if data.progress is not None:
             progress = data.progress
@@ -411,6 +436,11 @@ class SqliteTrajectoryStore:
             updates["runtime_fingerprint"] = data.runtime_fingerprint
         if data.external_refs is not None:
             updates["external_refs"] = dict(data.external_refs)
+        if data.artifacts is not None:
+            if data.merge_artifacts:
+                updates["artifacts"] = merge_artifacts(traj.artifacts, data.artifacts)
+            else:
+                updates["artifacts"] = merge_artifacts(None, data.artifacts, replace=True)
         traj = traj.model_copy(update=updates)
         self._update_trajectory(traj)
         if data.external_refs is not None:

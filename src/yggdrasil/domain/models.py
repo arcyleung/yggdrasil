@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from yggdrasil.domain.artifacts import ArtifactRef
 from yggdrasil.domain.enums import EffortPredicateOp, IndexState, StepKind, TrajectoryStatus
 
 
@@ -121,6 +122,7 @@ class Trajectory(BaseModel):
     runtime_fingerprint: RuntimeFingerprint | None = None
     tags: list[str] = Field(default_factory=list)
     external_refs: dict[str, Any] = Field(default_factory=dict)
+    artifacts: list[ArtifactRef] = Field(default_factory=list)
     progress: Progress = Field(default_factory=Progress)
     outcome: Outcome | None = None
     effort: EffortLedger = Field(default_factory=EffortLedger)
@@ -164,6 +166,11 @@ class SearchHit(BaseModel):
     runtime_fingerprint: RuntimeFingerprint | None = None
     tags: list[str] = Field(default_factory=list)
     external_refs: dict[str, Any] = Field(default_factory=dict)
+    artifacts: list[ArtifactRef] = Field(default_factory=list)
+    owner: str | None = None
+    agent_id: str | None = None
+    team: str | None = None
+    workspace: str | None = None
     scores: SearchScores | None = None
     score: float | None = None
     index_state: IndexState | None = None

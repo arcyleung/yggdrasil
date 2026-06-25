@@ -14,12 +14,14 @@ from yggdrasil.mcp.serialization import (
 from yggdrasil.services.errors import YggdrasilError
 
 AGENT_GUIDANCE = (
-    "Yggdrasil trajectory memory: record agent work as trajectories with concrete effort totals "
-    "(no cheap/expensive bands). Use start_trajectory at session start, append_step for progress "
-    "(re-embeds only on task/scaffold/checkpoint changes), finalize_trajectory on terminal outcome, "
-    "search_strategies before repeating hard work (include_open=true by default for partials), "
-    "get_trajectory for full detail, update_trajectory_meta for tags/task/scaffold patches. "
-    "Interpret effort numbers in user context; prefer low failure_waste_seconds when relevant."
+    "Yggdrasil org experience memory (not doc RAG). Before work that is uncertain to succeed or has "
+    "large research/setup overhead, call search_strategies (search_experience) to discover whether "
+    "other agents in the organization already tried similar goals—learn from their outcomes, effort, "
+    "and artifacts; always surface hit owner/agent_id/team so the user can follow up in person with "
+    "the people behind those trajectories. Write trajectories with external_refs "
+    "owner/agent_id/team/workspace and artifacts ({kind, path_or_url}) so others can find your work. "
+    "search_mode=lab for org/team discovery when owner is unknown; agent mode for strict gates. "
+    "get_trajectory for shortlisted depth; prefer low failure_waste_seconds."
 )
 
 
@@ -34,16 +36,21 @@ def register_tools(mcp: Any, ctx: AppContext) -> None:
         tags: list[str] | None = None,
         runtime_fingerprint: dict[str, Any] | None = None,
         external_refs: dict[str, Any] | None = None,
+        artifacts: list[dict[str, Any]] | None = None,
         embed_view_version: str = "coding_v1",
     ) -> dict[str, Any]:
         try:
+            refs = dict(external_refs or {})
+            if artifacts:
+                refs.setdefault("experience_grade", True)
             traj = ctx.session_service.start_trajectory(
                 task_text=task_text,
                 scaffold_text=scaffold_text,
                 domain=domain,
                 tags=tags,
                 runtime_fingerprint=runtime_fingerprint,
-                external_refs=external_refs,
+                external_refs=refs,
+                artifacts=artifacts,
                 embed_view_version=embed_view_version,
             )
             return trajectory_result(traj)
@@ -116,6 +123,14 @@ def register_tools(mcp: Any, ctx: AppContext) -> None:
         effort_predicates: list[dict[str, Any]] | None = None,
         runtime_filters: dict[str, Any] | None = None,
         prefer_low_waste: bool = False,
+        owner: str | None = None,
+        agent_id: str | None = None,
+        team: str | None = None,
+        workspace: str | None = None,
+        require_artifacts: bool | None = None,
+        experience_grade_only: bool | None = None,
+        search_mode: str = "agent",
+        include_archive: bool = False,
     ) -> dict[str, Any]:
         try:
             hits = ctx.search_service.search_strategies(
@@ -129,8 +144,21 @@ def register_tools(mcp: Any, ctx: AppContext) -> None:
                 effort_predicates=effort_predicates,
                 runtime_filters=runtime_filters,
                 prefer_low_waste=prefer_low_waste,
+                owner=owner,
+                agent_id=agent_id,
+                team=team,
+                workspace=workspace,
+                require_artifacts=require_artifacts,
+                experience_grade_only=experience_grade_only,
+                search_mode=search_mode,
+                include_archive=include_archive,
             )
-            return search_result(hits)
+            payload = search_result(hits)
+            gate = ctx.search_service.last_gate_result
+            if gate is not None:
+                payload["gate_warnings"] = list(gate.warnings)
+                payload["gate_dropped_count"] = len(gate.dropped)
+            return payload
         except Exception as exc:
             return error_payload(exc)
 
@@ -152,6 +180,8 @@ def register_tools(mcp: Any, ctx: AppContext) -> None:
         scaffold_text: str | None = None,
         runtime_fingerprint: dict[str, Any] | None = None,
         external_refs: dict[str, Any] | None = None,
+        artifacts: list[dict[str, Any]] | None = None,
+        merge_artifacts: bool = True,
     ) -> dict[str, Any]:
         try:
             traj = ctx.session_service.update_trajectory_meta(
@@ -161,6 +191,8 @@ def register_tools(mcp: Any, ctx: AppContext) -> None:
                 scaffold_text=scaffold_text,
                 runtime_fingerprint=runtime_fingerprint,
                 external_refs=external_refs,
+                artifacts=artifacts,
+                merge_artifacts=merge_artifacts,
             )
             return trajectory_result(traj)
         except Exception as exc:

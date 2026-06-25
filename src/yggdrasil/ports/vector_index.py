@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Protocol, Sequence, runtime_checkable
 from pydantic import BaseModel, ConfigDict, Field
+from yggdrasil.domain.artifacts import artifact_payload_fields, team_identity_from_refs
 from yggdrasil.domain.enums import TrajectoryStatus
 from yggdrasil.domain.models import EffortPredicate, Trajectory
 
@@ -46,6 +47,18 @@ class VectorPointPayload(BaseModel):
     network_class: str | None = None
     source: str | None = None
     external_source: str | None = None
+    # Team / lab forensics filters (from external_refs + artifacts)
+    owner: str | None = None
+    agent_id: str | None = None
+    team: str | None = None
+    workspace: str | None = None
+    project: str | None = None
+    experience_grade: bool = False
+    has_artifacts: bool = False
+    artifact_count: int = 0
+    artifact_paths: list[str] = Field(default_factory=list)
+    artifact_urls: list[str] = Field(default_factory=list)
+    artifact_kinds: list[str] = Field(default_factory=list)
 
 class UpsertVectorPoint(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -61,6 +74,12 @@ class VectorSearchQuery(BaseModel):
     status_in: list[TrajectoryStatus] | None = None
     include_open: bool = True
     tags_any: list[str] | None = None
+    owner: str | None = None
+    agent_id: str | None = None
+    team: str | None = None
+    workspace: str | None = None
+    require_artifacts: bool | None = None
+    experience_grade_only: bool | None = None
     effort_predicates: list[EffortPredicate] = Field(default_factory=list)
     runtime_filters: dict[str, Any] = Field(default_factory=dict)
     limit: int = 10
@@ -83,10 +102,15 @@ def payload_from_trajectory(
     fp = trajectory.runtime_fingerprint
     outcome = trajectory.outcome
     source = None
-    if trajectory.external_refs:
-        src = trajectory.external_refs.get("source")
+    refs = trajectory.external_refs or {}
+    if refs:
+        src = refs.get("source")
         if isinstance(src, str):
             source = src
+    ident = team_identity_from_refs(refs)
+    art_fields = artifact_payload_fields(trajectory.artifacts)
+    tags = list(trajectory.tags)
+    experience_grade = bool(refs.get("experience_grade")) or "experience_grade" in tags or "author_segmented" in tags
     return VectorPointPayload(
         trajectory_id=trajectory.id,
         domain=trajectory.domain,
@@ -95,7 +119,7 @@ def payload_from_trajectory(
         steps_count=trajectory.progress.steps_count,
         has_outcome=outcome is not None,
         goal_satisfied=outcome.goal_satisfied if outcome else None,
-        tags=list(trajectory.tags),
+        tags=tags,
         created_at=trajectory.created_at,
         updated_at=trajectory.updated_at,
         finalized_at=trajectory.finalized_at,
@@ -121,6 +145,17 @@ def payload_from_trajectory(
         network_class=fp.network_class if fp else None,
         source=source,
         external_source=source,
+        owner=ident["owner"],
+        agent_id=ident["agent_id"],
+        team=ident["team"],
+        workspace=ident["workspace"],
+        project=ident["project"],
+        experience_grade=experience_grade,
+        has_artifacts=bool(art_fields["has_artifacts"]),
+        artifact_count=int(art_fields["artifact_count"]),
+        artifact_paths=list(art_fields["artifact_paths"]),
+        artifact_urls=list(art_fields["artifact_urls"]),
+        artifact_kinds=list(art_fields["artifact_kinds"]),
     )
 
 @runtime_checkable

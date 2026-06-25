@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Any, Protocol, Sequence, runtime_checkable
 from pydantic import BaseModel, ConfigDict, Field
 from yggdrasil.domain.enums import IndexState, StepKind, TrajectoryStatus
+from yggdrasil.domain.artifacts import ArtifactRef
 from yggdrasil.domain.models import EffortLedger, Outcome, Progress, RuntimeFingerprint, Step, Trajectory
 
 class TrajectoryNotFoundError(Exception):
@@ -26,6 +27,7 @@ class CreateTrajectoryInput(BaseModel):
     runtime_fingerprint: RuntimeFingerprint | None = None
     tags: list[str] = Field(default_factory=list)
     external_refs: dict[str, Any] = Field(default_factory=dict)
+    artifacts: list[ArtifactRef] = Field(default_factory=list)
     progress: Progress | None = None
     effort: EffortLedger | None = None
     embed_view_version: str = "coding_v1"
@@ -63,6 +65,8 @@ class UpdateTrajectoryMetaInput(BaseModel):
     scaffold_text: str | None = None
     runtime_fingerprint: RuntimeFingerprint | None = None
     external_refs: dict[str, Any] | None = None
+    artifacts: list[ArtifactRef] | None = None
+    merge_artifacts: bool = True
 
 @runtime_checkable
 class TrajectoryStore(Protocol):

@@ -86,6 +86,13 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Import from JSON fixture instead of live Mongo",
     )
+    parser.add_argument(
+        "--hierarchical",
+        action="store_true",
+        help="Session aggregate + parent/child segments (Phase 2 importer)",
+    )
+    parser.add_argument("--limit-sessions", type=int, default=None, help="Max sessions when --hierarchical")
+    parser.add_argument("--embed-parent", action="store_true", help="Also embed parent trajectories")
     args = parser.parse_args(argv)
 
     config = load_config()
@@ -109,14 +116,22 @@ def main(argv: list[str] | None = None) -> int:
 
     importer = MongoConversationImporter(store, embed_service=embed_service)
 
+    hier_kwargs = dict(
+        reembed=args.reembed,
+        dry_run=args.dry_run,
+        hierarchical=args.hierarchical,
+        limit_sessions=args.limit_sessions,
+        embed_parent=args.embed_parent,
+    )
+
     if args.fixture:
         docs = load_fixture_docs(Path(args.fixture))
         if args.limit is not None:
             docs = docs[: args.limit]
-        stats = importer.import_many(docs, reembed=args.reembed, dry_run=args.dry_run)
+        stats = importer.import_many(docs, limit=args.limit, **hier_kwargs)
     elif mongo_uri:
         docs_iter = iter_live_mongo(mongo_uri, limit=args.limit)
-        stats = importer.import_many(docs_iter, reembed=args.reembed, dry_run=args.dry_run, limit=args.limit)
+        stats = importer.import_many(docs_iter, limit=args.limit, **hier_kwargs)
     else:
         default_fixture = ROOT / "tests" / "fixtures" / "mongo" / "conversation_sample.json"
         if default_fixture.exists():
@@ -124,25 +139,25 @@ def main(argv: list[str] | None = None) -> int:
             docs = load_fixture_docs(default_fixture)
             if args.limit is not None:
                 docs = docs[: args.limit]
-            stats = importer.import_many(docs, reembed=args.reembed, dry_run=args.dry_run)
+            stats = importer.import_many(docs, limit=args.limit, **hier_kwargs)
         else:
             print("error: provide --mongo-uri, MONGO_URI/creds, or --fixture", file=sys.stderr)
             return 2
 
-    print(
-        json.dumps(
-            {
-                "seen": stats.seen,
-                "imported": stats.imported,
-                "updated": stats.updated,
-                "skipped": stats.skipped,
-                "errors": stats.errors[:10],
-                "dry_run": args.dry_run,
-                "reembed": args.reembed,
-            },
-            indent=2,
-        )
-    )
+    out = {
+        "seen": stats.seen,
+        "imported": stats.imported,
+        "updated": stats.updated,
+        "skipped": stats.skipped,
+        "sessions": stats.sessions,
+        "parents": stats.parents,
+        "children": stats.children,
+        "errors": stats.errors[:10],
+        "dry_run": args.dry_run,
+        "reembed": args.reembed,
+        "hierarchical": args.hierarchical,
+    }
+    print(json.dumps(out, indent=2))
     return 0 if not stats.errors else 1
 
 

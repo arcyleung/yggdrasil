@@ -11,14 +11,26 @@ from yggdrasil.adapters.importers.mongo_normalize import (
     ir_message_text,
     normalize_mongo_doc,
 )
+from yggdrasil.adapters.importers.mongo_segment import segment_conversation_ir
+from yggdrasil.adapters.importers.segment_schema import SegmentedSession, TrajectorySegment
 from yggdrasil.domain.enums import StepKind, TrajectoryStatus
-from yggdrasil.domain.models import EffortLedger, EffortTotals, Progress, Step, Trajectory
+from yggdrasil.domain.models import EffortLedger, EffortTotals, Outcome, Progress, Step, Trajectory
+from yggdrasil.services.retrieval_gates import clean_task_text_for_embed
 
 
 @dataclass
 class MappedTrajectory:
     trajectory: Trajectory
     steps: list[Step]
+
+
+@dataclass
+class MappedSessionHierarchy:
+    """Parent session trajectory + embeddable child segments."""
+
+    parent: MappedTrajectory
+    children: list[MappedTrajectory]
+    segmented: SegmentedSession
 
 
 def _utcnow() -> datetime:
@@ -372,5 +384,237 @@ def map_mongo_conversation_doc(doc: dict[str, Any]) -> MappedTrajectory:
     """Map a claude_conversations.conversations-style document (dual-shape via normalizer)."""
     ir = normalize_mongo_doc(doc)
     return map_conversation_ir_legacy(ir)
+
+
+def _outcome_str_to_status(outcome: str) -> TrajectoryStatus:
+    o = (outcome or "unknown").lower()
+    if o in ("success", "ok", "done"):
+        return TrajectoryStatus.SUCCESS
+    if o in ("failed", "fail", "error"):
+        return TrajectoryStatus.FAIL
+    if o in ("aborted", "abort", "cancelled"):
+        return TrajectoryStatus.ABORTED
+    if o in ("partial", "in_progress", "wip"):
+        return TrajectoryStatus.PARTIAL
+    return TrajectoryStatus.PARTIAL
+
+
+def _build_steps_for_messages(
+    traj_id: str,
+    messages: list[IRMessage],
+    *,
+    created_at: datetime,
+    seq_offset: int = 0,
+) -> list[Step]:
+    """Reuse legacy step extraction on a message slice by temporarily mapping via IR."""
+    # Lightweight: call through pseudo-IR legacy for slice by building temporary steps
+    pseudo = ConversationIR(
+        session_id=None,
+        request_id=traj_id,
+        model=None,
+        created_at=created_at,
+        updated_at=created_at,
+        title=None,
+        project=None,
+        tags=[],
+        system_text="",
+        tool_names=[],
+        messages=messages,
+        usage=None,
+        source_shape="fixture_v1",
+        raw_external={},
+    )
+    mapped = map_conversation_ir_legacy(pseudo)
+    steps: list[Step] = []
+    for s in mapped.steps:
+        steps.append(
+            s.model_copy(
+                update={
+                    "trajectory_id": traj_id,
+                    "seq": s.seq + seq_offset,
+                }
+            )
+        )
+    return steps
+
+
+def map_session_hierarchy(
+    ir: ConversationIR,
+    segmented: SegmentedSession | None = None,
+    *,
+    embed_parent: bool = False,
+    caller_segments: list[TrajectorySegment] | list[dict[str, Any]] | None = None,
+) -> MappedSessionHierarchy:
+    """Map IR + hierarchical segments → parent trajectory + child trajectories.
+
+    Children are primary embed targets. Parent stores lineage/milestones; embed optional.
+    """
+    segmented = segmented or segment_conversation_ir(ir, caller_segments=caller_segments)
+    session_id = segmented.session_id
+    parent_id = f"mongo-session-{session_id}"
+    created_at = ir.created_at or _utcnow()
+    updated_at = ir.updated_at or created_at
+
+    parent_task = clean_task_text_for_embed(
+        segmented.parent_task or ir.title or "imported session"
+    ) or "imported session"
+    parent_scaffold = segmented.parent_scaffold or "imported session scaffold"
+    milestones = [
+        f"seg-{i:04d}:{seg.task[:80]}" for i, seg in enumerate(segmented.segments)
+    ]
+    parent_status = TrajectoryStatus.PARTIAL
+    statuses = [_outcome_str_to_status(s.outcome) for s in segmented.segments]
+    if statuses and all(s == TrajectoryStatus.SUCCESS for s in statuses):
+        parent_status = TrajectoryStatus.SUCCESS
+    elif any(s == TrajectoryStatus.FAIL for s in statuses):
+        parent_status = TrajectoryStatus.PARTIAL
+
+    parent_refs = {
+        "source": "mongo",
+        "db": "claude_conversations",
+        "collection": "conversations",
+        "session_id": session_id,
+        "kind": "session_parent",
+        "id": f"session:{session_id}",
+        "request_id": ir.request_id,
+        "request_ids": ir.raw_external.get("request_ids"),
+        "embed_target": embed_parent,
+        "segment_count": len(segmented.segments),
+        "segmentation_source": segmented.source,
+        "segments_json": [s.to_dict() for s in segmented.segments],
+    }
+    parent_tags = list(
+        dict.fromkeys([*ir.tags, "mongo_import", "session_parent", "has_segments"])
+    )
+    parent_traj = Trajectory(
+        id=parent_id,
+        domain="coding",
+        status=parent_status,
+        task_text=parent_task[:4000],
+        scaffold_text=parent_scaffold[:4000],
+        tags=parent_tags,
+        external_refs=parent_refs,
+        progress=Progress(
+            phase="imported_session",
+            summary=f"session {session_id} with {len(segmented.segments)} segments",
+            steps_count=len(ir.messages),
+            milestones=milestones,
+        ),
+        outcome=Outcome(
+            terminal_status=parent_status,
+            summary=f"imported session rollup ({len(segmented.segments)} segments)",
+            signals={"source": "mongo", "model": ir.model},
+            goal_satisfied=parent_status == TrajectoryStatus.SUCCESS,
+        ),
+        effort=_build_effort_from_ir(ir),
+        embed_view_version="coding_v1",
+        created_at=created_at,
+        updated_at=updated_at,
+        finalized_at=updated_at,
+    )
+    parent_steps = _build_steps_for_messages(parent_id, ir.messages, created_at=created_at)
+    parent_traj = parent_traj.model_copy(
+        update={
+            "progress": parent_traj.progress.model_copy(
+                update={"steps_count": len(parent_steps)}
+            )
+        }
+    )
+    parent_mapped = MappedTrajectory(trajectory=parent_traj, steps=parent_steps)
+
+    children: list[MappedTrajectory] = []
+    for idx, seg in enumerate(segmented.segments):
+        child_id = f"mongo-session-{session_id}-seg-{idx:04d}"
+        ext_id = f"session:{session_id}:seg:{idx}"
+        slice_msgs = ir.messages[seg.start_idx : seg.end_idx + 1]
+        status = _outcome_str_to_status(seg.outcome)
+        scaffold = seg.scaffold_hint or parent_scaffold
+        child_refs = {
+            "source": "mongo",
+            "db": "claude_conversations",
+            "collection": "conversations",
+            "session_id": session_id,
+            "kind": "session_segment",
+            "id": ext_id,
+            "parent_trajectory_id": parent_id,
+            "segment_index": idx,
+            "segment_kind": seg.segment_kind,
+            "start_idx": seg.start_idx,
+            "end_idx": seg.end_idx,
+            "embed_target": True,
+            "segmentation_source": segmented.source,
+        }
+        child_tags = list(
+            dict.fromkeys(
+                [
+                    *ir.tags,
+                    "mongo_import",
+                    "session_segment",
+                    f"seg_kind:{seg.segment_kind}",
+                    f"outcome:{seg.outcome}",
+                ]
+            )
+        )
+        child_task = clean_task_text_for_embed(seg.task) or seg.task[:4000]
+        child_traj = Trajectory(
+            id=child_id,
+            domain="coding",
+            status=status,
+            task_text=child_task[:4000],
+            scaffold_text=scaffold[:4000],
+            tags=child_tags,
+            external_refs=child_refs,
+            progress=Progress(
+                phase="imported_segment",
+                summary=f"segment {idx} msgs [{seg.start_idx},{seg.end_idx}]",
+                steps_count=len(slice_msgs),
+                last_step_summary=(
+                    ir_message_text(slice_msgs[-1])[:200] if slice_msgs else None
+                ),
+            ),
+            outcome=Outcome(
+                terminal_status=status,
+                summary=seg.outcome if seg.outcome != "unknown" else seg.task[:200],
+                signals={
+                    "source": "mongo",
+                    "segment_index": idx,
+                    "start_idx": seg.start_idx,
+                    "end_idx": seg.end_idx,
+                },
+                goal_satisfied=status == TrajectoryStatus.SUCCESS,
+                remaining_work=seg.notes,
+            ),
+            effort=EffortLedger(),  # segment-local effort unknown unless caller supplies
+            embed_view_version="coding_v1",
+            created_at=created_at,
+            updated_at=updated_at,
+            finalized_at=updated_at,
+        )
+        child_steps = _build_steps_for_messages(child_id, slice_msgs, created_at=created_at)
+        child_traj = child_traj.model_copy(
+            update={
+                "progress": child_traj.progress.model_copy(
+                    update={"steps_count": len(child_steps)}
+                )
+            }
+        )
+        children.append(MappedTrajectory(trajectory=child_traj, steps=child_steps))
+
+    return MappedSessionHierarchy(
+        parent=parent_mapped, children=children, segmented=segmented
+    )
+
+
+def map_mongo_session_doc(
+    doc: dict[str, Any],
+    *,
+    caller_segments: list[dict[str, Any]] | None = None,
+    embed_parent: bool = False,
+) -> MappedSessionHierarchy:
+    """Normalize one doc (or canonical session doc) → hierarchical trajectories."""
+    ir = normalize_mongo_doc(doc)
+    return map_session_hierarchy(
+        ir, caller_segments=caller_segments, embed_parent=embed_parent
+    )
 
 
