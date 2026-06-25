@@ -46,7 +46,8 @@ def load_fixture_docs(path: Path) -> list[dict]:
     return [data]
 
 
-def iter_live_mongo(uri: str, *, limit: int | None):
+def iter_live_mongo(uri: str, *, limit: int | None, projection: bool = True):
+    """Yield live docs. Strips request_headers by default (never needed for ingress)."""
     try:
         from pymongo import MongoClient
     except ImportError as exc:
@@ -56,7 +57,11 @@ def iter_live_mongo(uri: str, *, limit: int | None):
     client = MongoClient(uri, serverSelectionTimeoutMS=8000)
     try:
         coll = client["claude_conversations"]["conversations"]
-        cursor = coll.find({})
+        proj = None
+        if projection:
+            # exclude secrets; normalizer also drops headers defensively
+            proj = {"request_headers": 0}
+        cursor = coll.find({}, proj) if proj else coll.find({})
         if limit is not None:
             cursor = cursor.limit(limit)
         for doc in cursor:

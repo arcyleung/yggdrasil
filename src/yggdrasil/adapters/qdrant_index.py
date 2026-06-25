@@ -54,7 +54,9 @@ class QdrantIndex:
         self._effort_filter_mode = effort_filter_mode
         self._rrf_k = rrf_k
         self._owns_client = client is None
-        self._client = client or QdrantClient(url=url, api_key=api_key)
+        self._client = client or QdrantClient(
+            url=url, api_key=api_key, check_compatibility=False
+        )
 
     def close(self) -> None:
         if self._owns_client and hasattr(self._client, "close"):
@@ -130,6 +132,17 @@ class QdrantIndex:
         query_filter: qm.Filter | None,
         limit: int,
     ) -> list[Any]:
+        # qdrant-client >=1.14 uses query_points; older used search()
+        if hasattr(self._client, "query_points"):
+            result = self._client.query_points(
+                collection_name=self._collection,
+                query=vector,
+                using=vector_name,
+                query_filter=query_filter,
+                limit=limit,
+                with_payload=True,
+            )
+            return list(getattr(result, "points", None) or [])
         return self._client.search(
             collection_name=self._collection,
             query_vector=(vector_name, vector),

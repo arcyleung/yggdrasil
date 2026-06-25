@@ -1,0 +1,1 @@
+docker run --rm   --gpus all   -p 8000:8000   -v ~/.cache/huggingface:/root/.cache/huggingface   vllm/vllm-openai:latest   --model Qwen/Qwen3-Embedding-0.6B   --dtype bfloat16   --max-model-len 32768 --gpu_memory_utilization 0.7
