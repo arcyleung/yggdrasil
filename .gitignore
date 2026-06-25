@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Local runtime / secrets (never commit)
+.env
+.env.local
+mongo_creds.txt
+*.db
+*.sqlite
+*.sqlite3
+data/
+.qdrant_storage/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# SDD scratch
+.superpowers/
+
+# Test / tmp
+tmp/
+.temp/

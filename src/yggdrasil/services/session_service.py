@@ -1,0 +1,269 @@
+"""Session lifecycle orchestration over store + embed."""
+from __future__ import annotations
+
+from typing import Any
+
+from yggdrasil.domain.enums import IndexState, StepKind, TrajectoryStatus
+from yggdrasil.domain.models import EffortLedger, Outcome, Progress, RuntimeFingerprint, Step, Trajectory
+from yggdrasil.ports.store import (
+    AppendStepInput,
+    CreateTrajectoryInput,
+    FinalizeTrajectoryInput,
+    TrajectoryClosedError as StoreTrajectoryClosedError,
+    TrajectoryNotFoundError as StoreTrajectoryNotFoundError,
+    TrajectoryStore,
+    UpdateTrajectoryMetaInput,
+)
+from yggdrasil.ports.vector_index import NamedVectors
+from yggdrasil.services.embed_service import EmbedService, should_reembed
+from yggdrasil.services.errors import (
+    EmbedFailedError,
+    IndexFailedError,
+    NotFoundError,
+    StoreFailedError,
+    TrajectoryClosedError,
+    ValidationError,
+)
+
+
+class SessionService:
+    """Coordinates trajectory CRUD with embedding/indexing policy."""
+
+    def __init__(self, store: TrajectoryStore, embed_service: EmbedService) -> None:
+        self._store = store
+        self._embed = embed_service
+        self._vector_cache: dict[str, NamedVectors] = {}
+
+    def _map_store_error(self, exc: Exception) -> Exception:
+        if isinstance(exc, StoreTrajectoryNotFoundError):
+            return NotFoundError(f"trajectory not found: {exc.trajectory_id}")
+        if isinstance(exc, StoreTrajectoryClosedError):
+            return TrajectoryClosedError(
+                f"trajectory closed: {exc.trajectory_id} status={exc.status}"
+            )
+        return exc
+
+    def _index_and_mark(
+        self,
+        traj: Trajectory,
+        *,
+        reembed: bool,
+        hard_fail: bool = False,
+    ) -> Trajectory:
+        prior = self._vector_cache.get(traj.id)
+        try:
+            vectors = self._embed.index_trajectory(traj, reembed=reembed, prior_vectors=prior)
+            self._vector_cache[traj.id] = vectors
+            return self._store.set_index_state(traj.id, IndexState.INDEXED)
+        except (EmbedFailedError, IndexFailedError):
+            state = IndexState.ERROR if hard_fail else IndexState.STALE
+            try:
+                traj = self._store.set_index_state(traj.id, state)
+            except Exception:
+                pass
+            if hard_fail:
+                raise
+            return traj
+
+    def start_trajectory(
+        self,
+        *,
+        task_text: str,
+        scaffold_text: str,
+        domain: str = "coding",
+        tags: list[str] | None = None,
+        runtime_fingerprint: RuntimeFingerprint | dict[str, Any] | None = None,
+        external_refs: dict[str, Any] | None = None,
+        progress: Progress | dict[str, Any] | None = None,
+        effort: EffortLedger | dict[str, Any] | None = None,
+        embed_view_version: str = "coding_v1",
+        trajectory_id: str | None = None,
+    ) -> Trajectory:
+        if not task_text or not task_text.strip():
+            raise ValidationError("task_text is required")
+        if not scaffold_text or not scaffold_text.strip():
+            raise ValidationError("scaffold_text is required")
+
+        fp = runtime_fingerprint
+        if isinstance(fp, dict):
+            fp = RuntimeFingerprint.model_validate(fp)
+        prog = progress
+        if isinstance(prog, dict):
+            prog = Progress.model_validate(prog)
+        eff = effort
+        if isinstance(eff, dict):
+            eff = EffortLedger.model_validate(eff)
+
+        try:
+            traj = self._store.create(
+                CreateTrajectoryInput(
+                    id=trajectory_id,
+                    domain=domain,
+                    task_text=task_text,
+                    scaffold_text=scaffold_text,
+                    runtime_fingerprint=fp,
+                    tags=list(tags or []),
+                    external_refs=dict(external_refs or {}),
+                    progress=prog,
+                    effort=eff,
+                    embed_view_version=embed_view_version,
+                )
+            )
+        except Exception as exc:
+            mapped = self._map_store_error(exc)
+            if mapped is not exc:
+                raise mapped from exc
+            raise StoreFailedError(str(exc)) from exc
+
+        return self._index_and_mark(traj, reembed=True, hard_fail=True)
+
+    def append_step(
+        self,
+        *,
+        trajectory_id: str,
+        kind: StepKind | str,
+        summary: str,
+        payload: dict[str, Any] | None = None,
+        scaffold_update: str | None = None,
+        task_update: str | None = None,
+        is_checkpoint: bool = False,
+        progress: Progress | dict[str, Any] | None = None,
+        mark_partial: bool = False,
+        effort_delta: EffortLedger | dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if isinstance(kind, str):
+            kind = StepKind(kind)
+        prog = progress
+        if isinstance(prog, dict):
+            prog = Progress.model_validate(prog)
+        eff = effort_delta
+        if isinstance(eff, dict):
+            eff = EffortLedger.model_validate(eff)
+
+        try:
+            traj, step = self._store.append_step(
+                AppendStepInput(
+                    trajectory_id=trajectory_id,
+                    kind=kind,
+                    summary=summary,
+                    payload=dict(payload or {}),
+                    scaffold_update=scaffold_update,
+                    task_update=task_update,
+                    is_checkpoint=is_checkpoint,
+                    progress=prog,
+                    mark_partial=mark_partial,
+                    effort_delta=eff,
+                )
+            )
+        except Exception as exc:
+            mapped = self._map_store_error(exc)
+            if mapped is not exc:
+                raise mapped from exc
+            raise StoreFailedError(str(exc)) from exc
+
+        reembed = should_reembed(
+            task_changed=task_update is not None,
+            scaffold_changed=scaffold_update is not None,
+            is_checkpoint=is_checkpoint,
+        )
+        traj = self._index_and_mark(traj, reembed=reembed, hard_fail=False)
+        return {"trajectory": traj, "step": step}
+
+    def finalize_trajectory(
+        self,
+        *,
+        trajectory_id: str,
+        outcome: Outcome | dict[str, Any],
+        effort: EffortLedger | dict[str, Any] | None = None,
+        runtime_fingerprint: RuntimeFingerprint | dict[str, Any] | None = None,
+        progress: Progress | dict[str, Any] | None = None,
+        task_text: str | None = None,
+        scaffold_text: str | None = None,
+    ) -> Trajectory:
+        if isinstance(outcome, dict):
+            outcome = Outcome.model_validate(outcome)
+        eff = effort
+        if isinstance(eff, dict):
+            eff = EffortLedger.model_validate(eff)
+        fp = runtime_fingerprint
+        if isinstance(fp, dict):
+            fp = RuntimeFingerprint.model_validate(fp)
+        prog = progress
+        if isinstance(prog, dict):
+            prog = Progress.model_validate(prog)
+
+        try:
+            traj = self._store.finalize(
+                FinalizeTrajectoryInput(
+                    trajectory_id=trajectory_id,
+                    outcome=outcome,
+                    effort=eff,
+                    runtime_fingerprint=fp,
+                    progress=prog,
+                    task_text=task_text,
+                    scaffold_text=scaffold_text,
+                )
+            )
+        except Exception as exc:
+            mapped = self._map_store_error(exc)
+            if mapped is not exc:
+                raise mapped from exc
+            raise StoreFailedError(str(exc)) from exc
+
+        reembed = should_reembed(
+            task_changed=task_text is not None,
+            scaffold_changed=scaffold_text is not None,
+            is_checkpoint=False,
+        )
+        # always refresh payload on finalize (status/outcome changed)
+        return self._index_and_mark(traj, reembed=reembed or True, hard_fail=False)
+
+    def update_trajectory_meta(
+        self,
+        *,
+        trajectory_id: str,
+        tags: list[str] | None = None,
+        task_text: str | None = None,
+        scaffold_text: str | None = None,
+        runtime_fingerprint: RuntimeFingerprint | dict[str, Any] | None = None,
+        external_refs: dict[str, Any] | None = None,
+    ) -> Trajectory:
+        fp = runtime_fingerprint
+        if isinstance(fp, dict):
+            fp = RuntimeFingerprint.model_validate(fp)
+        try:
+            traj = self._store.update_meta(
+                UpdateTrajectoryMetaInput(
+                    trajectory_id=trajectory_id,
+                    tags=tags,
+                    task_text=task_text,
+                    scaffold_text=scaffold_text,
+                    runtime_fingerprint=fp,
+                    external_refs=external_refs,
+                )
+            )
+        except Exception as exc:
+            mapped = self._map_store_error(exc)
+            if mapped is not exc:
+                raise mapped from exc
+            raise StoreFailedError(str(exc)) from exc
+
+        reembed = should_reembed(
+            task_changed=task_text is not None,
+            scaffold_changed=scaffold_text is not None,
+            is_checkpoint=False,
+        )
+        return self._index_and_mark(traj, reembed=reembed, hard_fail=False)
+
+    def get_trajectory(self, trajectory_id: str, *, include_steps: bool = True) -> dict[str, Any]:
+        try:
+            traj = self._store.get(trajectory_id)
+            steps: list[Step] = []
+            if include_steps:
+                steps = self._store.get_steps(trajectory_id)
+        except Exception as exc:
+            mapped = self._map_store_error(exc)
+            if mapped is not exc:
+                raise mapped from exc
+            raise StoreFailedError(str(exc)) from exc
+        return {"trajectory": traj, "steps": steps}
