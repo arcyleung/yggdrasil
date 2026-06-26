@@ -10,7 +10,7 @@ from typing import Any, Sequence
 
 from yggdrasil.domain.artifacts import ArtifactRef, artifacts_from_step_payload, merge_artifacts
 from yggdrasil.domain.effort import is_terminal_status, is_writable_status, merge_effort_ledgers
-from yggdrasil.domain.enums import IndexState, TrajectoryStatus
+from yggdrasil.domain.enums import IndexStatus, TrajectoryStatus, coerce_index_status
 from yggdrasil.domain.models import (
     EffortLedger,
     Outcome,
@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS trajectories (
     outcome_json TEXT,
     effort_json TEXT NOT NULL DEFAULT '{}',
     embed_view_version TEXT NOT NULL DEFAULT 'coding_v1',
-    index_state TEXT NOT NULL DEFAULT 'pending',
+    index_status TEXT NOT NULL DEFAULT 'pending',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     finalized_at TEXT
@@ -118,6 +118,9 @@ class SqliteTrajectoryStore:
         self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
+        # PoC multi-thread / multi-process safety knobs
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(SCHEMA_SQL)
         self._migrate_schema()
         self._conn.commit()
@@ -128,9 +131,51 @@ class SqliteTrajectoryStore:
             self._conn.execute(
                 "ALTER TABLE trajectories ADD COLUMN artifacts_json TEXT NOT NULL DEFAULT '[]'"
             )
+            cols.add("artifacts_json")
+
+        # Wave C: index_status replaces index_state (legacy column may still exist)
+        if "index_status" not in cols and "index_state" in cols:
+            self._conn.execute(
+                "ALTER TABLE trajectories ADD COLUMN index_status TEXT NOT NULL DEFAULT 'pending'"
+            )
+            self._conn.execute(
+                """
+                UPDATE trajectories SET index_status = CASE index_state
+                    WHEN 'indexed' THEN 'ready'
+                    WHEN 'error' THEN 'failed'
+                    WHEN 'ready' THEN 'ready'
+                    WHEN 'failed' THEN 'failed'
+                    WHEN 'stale' THEN 'stale'
+                    WHEN 'pending' THEN 'pending'
+                    ELSE 'pending'
+                END
+                """
+            )
+            cols.add("index_status")
+        elif "index_status" not in cols:
+            self._conn.execute(
+                "ALTER TABLE trajectories ADD COLUMN index_status TEXT NOT NULL DEFAULT 'pending'"
+            )
+            cols.add("index_status")
+        else:
+            # Normalize any legacy values still stored in index_status
+            self._conn.execute(
+                "UPDATE trajectories SET index_status = 'ready' WHERE index_status = 'indexed'"
+            )
+            self._conn.execute(
+                "UPDATE trajectories SET index_status = 'failed' WHERE index_status = 'error'"
+            )
 
     def close(self) -> None:
         self._conn.close()
+
+    def _row_index_status(self, row: sqlite3.Row) -> IndexStatus:
+        keys = row.keys()
+        if "index_status" in keys and row["index_status"] is not None:
+            return coerce_index_status(row["index_status"])
+        if "index_state" in keys and row["index_state"] is not None:
+            return coerce_index_status(row["index_state"])
+        return IndexStatus.PENDING
 
     def _row_to_trajectory(self, row: sqlite3.Row) -> Trajectory:
         runtime_raw = _json_loads(row["runtime_fingerprint_json"])
@@ -158,7 +203,7 @@ class SqliteTrajectoryStore:
             outcome=Outcome.model_validate(outcome_raw) if outcome_raw else None,
             effort=EffortLedger.model_validate(effort_raw or {}),
             embed_view_version=row["embed_view_version"],
-            index_state=IndexState(row["index_state"]),
+            index_status=self._row_index_status(row),
             created_at=_dt_from_str(row["created_at"]) or _utcnow(),
             updated_at=_dt_from_str(row["updated_at"]) or _utcnow(),
             finalized_at=_dt_from_str(row["finalized_at"]),
@@ -185,7 +230,7 @@ class SqliteTrajectoryStore:
                 id, domain, status, task_text, scaffold_text,
                 runtime_fingerprint_json, tags_json, external_refs_json, artifacts_json,
                 progress_json, outcome_json, effort_json,
-                embed_view_version, index_state, created_at, updated_at, finalized_at
+                embed_view_version, index_status, created_at, updated_at, finalized_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -202,7 +247,7 @@ class SqliteTrajectoryStore:
                 _json_dumps(traj.outcome) if traj.outcome else None,
                 _json_dumps(traj.effort),
                 traj.embed_view_version,
-                traj.index_state.value,
+                traj.index_status.value,
                 _dt_to_str(traj.created_at),
                 _dt_to_str(traj.updated_at),
                 _dt_to_str(traj.finalized_at),
@@ -217,7 +262,7 @@ class SqliteTrajectoryStore:
                 runtime_fingerprint_json = ?, tags_json = ?, external_refs_json = ?,
                 artifacts_json = ?,
                 progress_json = ?, outcome_json = ?, effort_json = ?,
-                embed_view_version = ?, index_state = ?, updated_at = ?, finalized_at = ?
+                embed_view_version = ?, index_status = ?, updated_at = ?, finalized_at = ?
             WHERE id = ?
             """,
             (
@@ -233,7 +278,7 @@ class SqliteTrajectoryStore:
                 _json_dumps(traj.outcome) if traj.outcome else None,
                 _json_dumps(traj.effort),
                 traj.embed_view_version,
-                traj.index_state.value,
+                traj.index_status.value,
                 _dt_to_str(traj.updated_at),
                 _dt_to_str(traj.finalized_at),
                 traj.id,
@@ -276,7 +321,7 @@ class SqliteTrajectoryStore:
             outcome=None,
             effort=effort,
             embed_view_version=data.embed_view_version,
-            index_state=IndexState.PENDING,
+            index_status=IndexStatus.PENDING,
             created_at=now,
             updated_at=now,
             finalized_at=None,
@@ -310,88 +355,97 @@ class SqliteTrajectoryStore:
             f"SELECT * FROM trajectories WHERE id IN ({placeholders})",
             list(trajectory_ids),
         ).fetchall()
-        by_id = {self._row_to_trajectory(r).id: self._row_to_trajectory(r) for r in rows}
-        # re-read once properly
-        by_id = {}
+        by_id: dict[str, Trajectory] = {}
         for r in rows:
             t = self._row_to_trajectory(r)
             by_id[t.id] = t
         return [by_id[tid] for tid in trajectory_ids if tid in by_id]
 
     def append_step(self, data: AppendStepInput) -> tuple[Trajectory, Step]:
-        traj = self.get(data.trajectory_id)
-        self._require_writable(traj)
-        now = data.recorded_at or _utcnow()
-        max_seq_row = self._conn.execute(
-            "SELECT COALESCE(MAX(seq), 0) AS m FROM steps WHERE trajectory_id = ?",
-            (data.trajectory_id,),
-        ).fetchone()
-        next_seq = int(max_seq_row["m"]) + 1
-
-        step = Step(
-            trajectory_id=data.trajectory_id,
-            seq=next_seq,
-            kind=data.kind,
-            summary=data.summary,
-            payload=dict(data.payload),
-            scaffold_update=data.scaffold_update,
-            is_checkpoint=data.is_checkpoint,
-            recorded_at=now,
-            step_effort=data.effort_delta,
-        )
-        self._conn.execute(
-            """
-            INSERT INTO steps (
-                trajectory_id, seq, kind, summary, payload_json,
-                scaffold_update, is_checkpoint, recorded_at, step_effort_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                step.trajectory_id,
-                step.seq,
-                step.kind.value if hasattr(step.kind, "value") else step.kind,
-                step.summary,
-                _json_dumps(step.payload),
-                step.scaffold_update,
-                1 if step.is_checkpoint else 0,
-                _dt_to_str(step.recorded_at),
-                _json_dumps(step.step_effort) if step.step_effort else None,
-            ),
-        )
-
-        if data.task_update is not None:
-            traj = traj.model_copy(update={"task_text": data.task_update})
-        if data.scaffold_update is not None:
-            traj = traj.model_copy(update={"scaffold_text": data.scaffold_update})
-        if data.effort_delta is not None:
-            traj = traj.model_copy(update={"effort": merge_effort_ledgers(traj.effort, data.effort_delta)})
-        if data.mark_partial:
-            traj = traj.model_copy(update={"status": TrajectoryStatus.PARTIAL})
-
-        # Harvest artifact refs from step payloads (skill contract)
-        step_arts = artifacts_from_step_payload(step.payload, step_seq=step.seq)
-        if step_arts:
-            traj = traj.model_copy(update={"artifacts": merge_artifacts(traj.artifacts, step_arts)})
-
-        progress = traj.progress
-        if data.progress is not None:
-            progress = data.progress
-        else:
-            progress = progress.model_copy(
-                update={
-                    "steps_count": progress.steps_count + 1,
-                    "last_step_summary": data.summary,
-                }
+        # BEGIN IMMEDIATE acquires a write lock so seq allocation is race-safe
+        # under concurrent writers (WAL + busy_timeout).
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            traj = self.get(data.trajectory_id)
+            self._require_writable(traj)
+            now = data.recorded_at or _utcnow()
+            # Allocate seq inside the write transaction (subquery avoids TOCTOU)
+            cur = self._conn.execute(
+                """
+                INSERT INTO steps (
+                    trajectory_id, seq, kind, summary, payload_json,
+                    scaffold_update, is_checkpoint, recorded_at, step_effort_json
+                )
+                SELECT
+                    ?,
+                    COALESCE((SELECT MAX(seq) FROM steps WHERE trajectory_id = ?), 0) + 1,
+                    ?, ?, ?, ?, ?, ?, ?
+                """,
+                (
+                    data.trajectory_id,
+                    data.trajectory_id,
+                    data.kind.value if hasattr(data.kind, "value") else data.kind,
+                    data.summary,
+                    _json_dumps(dict(data.payload)),
+                    data.scaffold_update,
+                    1 if data.is_checkpoint else 0,
+                    _dt_to_str(now),
+                    _json_dumps(data.effort_delta) if data.effort_delta else None,
+                ),
             )
-        traj = traj.model_copy(update={"progress": progress, "updated_at": now})
-        self._update_trajectory(traj)
-        self._conn.commit()
-        return traj, step
+            # Re-read allocated seq
+            seq_row = self._conn.execute(
+                "SELECT MAX(seq) AS m FROM steps WHERE trajectory_id = ?",
+                (data.trajectory_id,),
+            ).fetchone()
+            next_seq = int(seq_row["m"])
+
+            step = Step(
+                trajectory_id=data.trajectory_id,
+                seq=next_seq,
+                kind=data.kind,
+                summary=data.summary,
+                payload=dict(data.payload),
+                scaffold_update=data.scaffold_update,
+                is_checkpoint=data.is_checkpoint,
+                recorded_at=now,
+                step_effort=data.effort_delta,
+            )
+
+            if data.task_update is not None:
+                traj = traj.model_copy(update={"task_text": data.task_update})
+            if data.scaffold_update is not None:
+                traj = traj.model_copy(update={"scaffold_text": data.scaffold_update})
+            if data.effort_delta is not None:
+                traj = traj.model_copy(update={"effort": merge_effort_ledgers(traj.effort, data.effort_delta)})
+            if data.mark_partial:
+                traj = traj.model_copy(update={"status": TrajectoryStatus.PARTIAL})
+
+            step_arts = artifacts_from_step_payload(step.payload, step_seq=step.seq)
+            if step_arts:
+                traj = traj.model_copy(update={"artifacts": merge_artifacts(traj.artifacts, step_arts)})
+
+            progress = traj.progress
+            if data.progress is not None:
+                progress = data.progress
+            else:
+                progress = progress.model_copy(
+                    update={
+                        "steps_count": progress.steps_count + 1,
+                        "last_step_summary": data.summary,
+                    }
+                )
+            traj = traj.model_copy(update={"progress": progress, "updated_at": now})
+            self._update_trajectory(traj)
+            self._conn.commit()
+            return traj, step
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def finalize(self, data: FinalizeTrajectoryInput) -> Trajectory:
         traj = self.get(data.trajectory_id)
         if is_terminal_status(traj.status) and traj.status != TrajectoryStatus.PARTIAL:
-            # allow finalize from partial/open only; success/fail/aborted are closed
             if traj.status in (TrajectoryStatus.SUCCESS, TrajectoryStatus.FAIL, TrajectoryStatus.ABORTED):
                 raise TrajectoryClosedError(traj.id, traj.status)
         if traj.finalized_at is not None and traj.status in (
@@ -448,12 +502,16 @@ class SqliteTrajectoryStore:
         self._conn.commit()
         return traj
 
-    def set_index_state(self, trajectory_id: str, index_state: IndexState) -> Trajectory:
+    def set_index_status(self, trajectory_id: str, index_status: IndexStatus) -> Trajectory:
         traj = self.get(trajectory_id)
-        traj = traj.model_copy(update={"index_state": index_state, "updated_at": _utcnow()})
+        traj = traj.model_copy(update={"index_status": index_status, "updated_at": _utcnow()})
         self._update_trajectory(traj)
         self._conn.commit()
         return traj
+
+    def set_index_state(self, trajectory_id: str, index_state: IndexStatus) -> Trajectory:
+        """Back-compat alias for set_index_status."""
+        return self.set_index_status(trajectory_id, index_state)
 
     def find_by_external_ref(self, source: str, external_id: str) -> Trajectory | None:
         row = self._conn.execute(
@@ -468,7 +526,7 @@ class SqliteTrajectoryStore:
             return None
         return self._row_to_trajectory(row)
 
-    def upsert_imported(self, trajectory: Trajectory, steps: Sequence[Step]) -> Trajectory:
+    def _upsert_imported_no_commit(self, trajectory: Trajectory, steps: Sequence[Step]) -> Trajectory:
         existing = None
         source = trajectory.external_refs.get("source")
         external_id = trajectory.external_refs.get("id")
@@ -510,8 +568,27 @@ class SqliteTrajectoryStore:
                 ),
             )
         self._sync_external_refs(trajectory.id, trajectory.external_refs)
+        return trajectory
+
+    def upsert_imported(self, trajectory: Trajectory, steps: Sequence[Step]) -> Trajectory:
+        trajectory = self._upsert_imported_no_commit(trajectory, steps)
         self._conn.commit()
         return trajectory
+
+    def upsert_imported_many(
+        self, items: Sequence[tuple[Trajectory, Sequence[Step]]]
+    ) -> list[Trajectory]:
+        """Persist multiple trajectories+steps in a single transaction (hierarchical import)."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            out: list[Trajectory] = []
+            for trajectory, steps in items:
+                out.append(self._upsert_imported_no_commit(trajectory, steps))
+            self._conn.commit()
+            return out
+        except Exception:
+            self._conn.rollback()
+            raise
 
 
 # Protocol satisfaction check (static typing aid)

@@ -1,6 +1,8 @@
-"""Idempotent Mongo conversation importer into TrajectoryStore (legacy + hierarchical)."""
+"""Idempotent Mongo conversation importer into TrajectoryStore (hierarchical primary)."""
 from __future__ import annotations
 
+import logging
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -17,10 +19,13 @@ from yggdrasil.adapters.importers.mongo_normalize import (
 )
 from yggdrasil.adapters.importers.mongo_segment import segment_conversation_ir
 from yggdrasil.adapters.importers.segment_schema import TrajectorySegment
-from yggdrasil.domain.enums import IndexState
+from yggdrasil.domain.enums import IndexStatus
+from yggdrasil.domain.models import Step, Trajectory
 from yggdrasil.ports.store import TrajectoryStore
 from yggdrasil.services.embed_service import EmbedService
 from yggdrasil.services.errors import EmbedFailedError, IndexFailedError
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -47,6 +52,23 @@ class MongoConversationImporter:
         self._store = store
         self._embed = embed_service
 
+    def _embed_one(self, traj: Trajectory, *, reembed: bool, embed_target: bool) -> Trajectory:
+        if not (reembed and embed_target and self._embed is not None):
+            return traj
+        prior = traj.index_status
+        try:
+            self._embed.index_trajectory(traj, reembed=True)
+            return self._store.set_index_status(traj.id, IndexStatus.READY)
+        except (EmbedFailedError, IndexFailedError) as exc:
+            state = IndexStatus.STALE if prior == IndexStatus.READY else IndexStatus.FAILED
+            logger.warning(
+                "embed failed for trajectory %s → index_status=%s: %s",
+                traj.id,
+                state.value,
+                exc,
+            )
+            return self._store.set_index_status(traj.id, state)
+
     def _persist_mapped(
         self,
         mapped: MappedTrajectory,
@@ -64,15 +86,11 @@ class MongoConversationImporter:
         if force_embed is not None:
             embed_target = force_embed
         if reembed and embed_target and self._embed is not None:
-            try:
-                self._embed.index_trajectory(traj, reembed=True)
-                traj = self._store.set_index_state(traj.id, IndexState.INDEXED)
-            except (EmbedFailedError, IndexFailedError):
-                traj = self._store.set_index_state(traj.id, IndexState.STALE)
+            traj = self._embed_one(traj, reembed=True, embed_target=True)
         elif existing is None:
             try:
-                state = IndexState.PENDING if embed_target else IndexState.PENDING
-                traj = self._store.set_index_state(traj.id, state)
+                # Non-embed targets stay pending (excluded from default search)
+                traj = self._store.set_index_status(traj.id, IndexStatus.PENDING)
             except Exception:
                 pass
         mapped.trajectory = traj
@@ -85,7 +103,16 @@ class MongoConversationImporter:
         reembed: bool = False,
         dry_run: bool = False,
     ) -> MappedTrajectory:
-        """Legacy: one doc → one trajectory (no hierarchy)."""
+        """Deprecated legacy path: one doc → one trajectory (no hierarchy).
+
+        Prefer ``import_session_aggregate`` / ``import_docs_as_sessions``.
+        """
+        warnings.warn(
+            "MongoConversationImporter.import_doc is deprecated; use hierarchical "
+            "import_docs_as_sessions / import_session_aggregate (Wave E).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         mapped = map_mongo_conversation_doc(doc)
         return self._persist_mapped(mapped, reembed=reembed, dry_run=dry_run)
 
@@ -98,25 +125,54 @@ class MongoConversationImporter:
         embed_parent: bool = False,
         embed_children: bool = True,
     ) -> MappedSessionHierarchy:
-        """Persist parent + children; embed children (and optionally parent)."""
-        parent = self._persist_mapped(
-            hierarchy.parent,
-            reembed=reembed and embed_parent,
-            dry_run=dry_run,
-            force_embed=embed_parent,
-        )
-        children: list[MappedTrajectory] = []
+        """Persist parent + children transactionally; embed best-effort after commit.
+
+        SQLite policy (Wave C / C4): all trajectory rows for one logical session are
+        written in a single transaction via ``upsert_imported_many`` when available.
+        Vector embeds run *after* commit so partial embed failure leaves rows queryable
+        via SQLite ``get`` with index_status failed/stale (not in default search).
+        """
+        if dry_run:
+            return hierarchy
+
+        items: list[tuple[Trajectory, list[Step]]] = [
+            (hierarchy.parent.trajectory, list(hierarchy.parent.steps)),
+        ]
         for child in hierarchy.children:
-            children.append(
-                self._persist_mapped(
-                    child,
-                    reembed=reembed and embed_children,
-                    dry_run=dry_run,
-                    force_embed=embed_children,
-                )
+            items.append((child.trajectory, list(child.steps)))
+
+        upsert_many = getattr(self._store, "upsert_imported_many", None)
+        if callable(upsert_many):
+            persisted = upsert_many(items)
+        else:
+            # Fallback: sequential commits (legacy stores)
+            persisted = [
+                self._store.upsert_imported(traj, steps) for traj, steps in items
+            ]
+
+        parent_traj = persisted[0]
+        child_trajs = persisted[1:]
+
+        # Best-effort embeds after SQLite commit
+        parent_embed = embed_parent
+        parent_traj = self._embed_one(
+            parent_traj,
+            reembed=reembed and parent_embed,
+            embed_target=parent_embed,
+        )
+        hierarchy.parent.trajectory = parent_traj
+        hierarchy.parent.steps = list(hierarchy.parent.steps)
+
+        out_children: list[MappedTrajectory] = []
+        for mapped_child, traj in zip(hierarchy.children, child_trajs):
+            traj = self._embed_one(
+                traj,
+                reembed=reembed and embed_children,
+                embed_target=embed_children,
             )
-        hierarchy.parent = parent
-        hierarchy.children = children
+            mapped_child.trajectory = traj
+            out_children.append(mapped_child)
+        hierarchy.children = out_children
         return hierarchy
 
     def import_session_aggregate(
@@ -202,45 +258,30 @@ class MongoConversationImporter:
         reembed: bool = False,
         dry_run: bool = False,
         limit: int | None = None,
-        hierarchical: bool = False,
+        hierarchical: bool = True,
         limit_sessions: int | None = None,
         embed_parent: bool = False,
     ) -> ImportStats:
-        if hierarchical:
-            limited_docs: list[dict[str, Any]] = []
-            for i, doc in enumerate(docs):
-                if limit is not None and i >= limit:
-                    break
-                limited_docs.append(doc)
-            return self.import_docs_as_sessions(
-                limited_docs,
-                reembed=reembed,
-                dry_run=dry_run,
-                limit_sessions=limit_sessions,
-                embed_parent=embed_parent,
-            )
+        """Import Mongo docs. Hierarchical session path is the only supported ingress.
 
-        stats = ImportStats()
-        for doc in docs:
-            if limit is not None and stats.seen >= limit:
+        ``hierarchical=False`` raises ``SystemExit`` (Wave E deprecation).
+        """
+        if not hierarchical:
+            raise SystemExit(
+                "Non-hierarchical mongo import is removed (Wave E). "
+                "Use hierarchical=True (default) or import_docs_as_sessions / "
+                "scripts/import_mongo_sessions.py. Legacy one-doc mapping remains "
+                "only as a test helper (map_mongo_conversation_doc)."
+            )
+        limited_docs: list[dict[str, Any]] = []
+        for i, doc in enumerate(docs):
+            if limit is not None and i >= limit:
                 break
-            stats.seen += 1
-            try:
-                external_id = None
-                doc_id = doc.get("_id")
-                if isinstance(doc_id, dict) and "$oid" in doc_id:
-                    external_id = str(doc_id["$oid"])
-                elif doc_id is not None:
-                    external_id = str(doc_id)
-                existed = False
-                if external_id:
-                    existed = self._store.find_by_external_ref("mongo", external_id) is not None
-                self.import_doc(doc, reembed=reembed, dry_run=dry_run)
-                if existed:
-                    stats.updated += 1
-                else:
-                    stats.imported += 1
-            except Exception as exc:
-                stats.errors.append(str(exc))
-                stats.skipped += 1
-        return stats
+            limited_docs.append(doc)
+        return self.import_docs_as_sessions(
+            limited_docs,
+            reembed=reembed,
+            dry_run=dry_run,
+            limit_sessions=limit_sessions,
+            embed_parent=embed_parent,
+        )

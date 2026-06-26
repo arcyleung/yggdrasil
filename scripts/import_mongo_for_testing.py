@@ -88,12 +88,27 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--hierarchical",
-        action="store_true",
-        help="Session aggregate + parent/child segments (Phase 2 importer)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Session aggregate + parent/child segments (default: on; --no-hierarchical exits)",
     )
-    parser.add_argument("--limit-sessions", type=int, default=None, help="Max sessions when --hierarchical")
+    parser.add_argument(
+        "--limit-sessions",
+        type=int,
+        default=None,
+        help="Max sessions (hierarchical path; default)",
+    )
     parser.add_argument("--embed-parent", action="store_true", help="Also embed parent trajectories")
     args = parser.parse_args(argv)
+
+    if not args.hierarchical:
+        print(
+            "error: non-hierarchical mongo import is removed (Wave E). "
+            "Omit --no-hierarchical (default is hierarchical) or use "
+            "scripts/import_mongo_sessions.py.",
+            file=sys.stderr,
+        )
+        return 2
 
     config = load_config()
     # Do not print URI; redact config only
@@ -119,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     hier_kwargs = dict(
         reembed=args.reembed,
         dry_run=args.dry_run,
-        hierarchical=args.hierarchical,
+        hierarchical=True,
         limit_sessions=args.limit_sessions,
         embed_parent=args.embed_parent,
     )

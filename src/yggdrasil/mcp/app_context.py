@@ -44,11 +44,18 @@ class AppContext:
             api_key=cfg.qdrant_api_key,
             fusion=cfg.fusion,
             effort_filter_mode=cfg.effort_filter_mode,
+            w_task=cfg.w_task,
+            w_scaffold=cfg.w_scaffold,
         )
         index.ensure_collection(vector_size=cfg.embed_dim)
         view = get_embed_view(cfg.embed_view_version)
         embed_service = EmbedService(embedder, index, view, cfg)
-        session_service = SessionService(store, embed_service)
+        scrubber = None
+        if cfg.scrub_content:
+            from yggdrasil.adapters.regex_scrubber import RegexContentScrubber
+
+            scrubber = RegexContentScrubber()
+        session_service = SessionService(store, embed_service, scrubber=scrubber)
         search_service = SearchService(store, embedder, index, view, cfg)
         return cls(
             config=cfg,

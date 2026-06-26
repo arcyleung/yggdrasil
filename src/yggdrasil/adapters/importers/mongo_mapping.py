@@ -1,6 +1,15 @@
-"""Map MongoDB conversation documents to trajectories (testing shim)."""
+"""Map MongoDB conversation documents to trajectories.
+
+Primary production path: ``map_session_hierarchy`` / ``map_mongo_session_doc``
+(hierarchical parent + child segments).
+
+Legacy one-doc→one-trajectory helpers (``map_conversation_ir_legacy``,
+``map_mongo_conversation_doc``) remain for unit tests and smoke scripts only;
+ingress callers must use hierarchical import (Wave E).
+"""
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -16,6 +25,21 @@ from yggdrasil.adapters.importers.segment_schema import SegmentedSession, Trajec
 from yggdrasil.domain.enums import StepKind, TrajectoryStatus
 from yggdrasil.domain.models import EffortLedger, EffortTotals, Outcome, Progress, Step, Trajectory
 from yggdrasil.services.retrieval_gates import clean_task_text_for_embed
+
+_LEGACY_WARNED = False
+
+
+def _warn_legacy_once(name: str) -> None:
+    global _LEGACY_WARNED
+    if _LEGACY_WARNED:
+        return
+    _LEGACY_WARNED = True
+    warnings.warn(
+        f"{name} is deprecated; use hierarchical map_session_hierarchy / "
+        "MongoConversationImporter.import_docs_as_sessions (Wave E).",
+        DeprecationWarning,
+        stacklevel=3,
+    )
 
 
 @dataclass
@@ -164,8 +188,135 @@ def _has_block_type(msg: IRMessage, block_type: str) -> bool:
     )
 
 
+def messages_to_steps(
+    traj_id: str,
+    messages: list[IRMessage],
+    *,
+    created_at: datetime | None = None,
+    seq_offset: int = 0,
+) -> list[Step]:
+    """Convert IR messages to Step rows (shared by legacy map and hierarchical children)."""
+    base_time = created_at or _utcnow()
+    steps: list[Step] = []
+    seq = seq_offset
+    for msg in messages:
+        recorded = msg.timestamp or base_time
+        role = msg.role
+
+        # Fixture OpenAI-style tool_calls on assistant
+        if msg.tool_calls and role == "assistant":
+            for tc in msg.tool_calls:
+                seq += 1
+                name = ""
+                if isinstance(tc, dict):
+                    fn = tc.get("function") or {}
+                    name = fn.get("name") or tc.get("name") or "tool"
+                steps.append(
+                    Step(
+                        trajectory_id=traj_id,
+                        seq=seq,
+                        kind=StepKind.TOOL_CALL,
+                        summary=f"tool_call: {name}",
+                        payload={"tool_call": tc},
+                        recorded_at=recorded,
+                    )
+                )
+            text = ir_message_text(msg).strip()
+            if text:
+                seq += 1
+                steps.append(
+                    Step(
+                        trajectory_id=traj_id,
+                        seq=seq,
+                        kind=StepKind.THOUGHT,
+                        summary=text[:500],
+                        payload={"role": "assistant"},
+                        recorded_at=recorded,
+                    )
+                )
+            continue
+
+        # Anthropic proxy: tool_use / tool_result blocks
+        if role == "assistant" and _has_block_type(msg, "tool_use"):
+            extra, seq = _anthropic_tool_use_steps(
+                traj_id, msg, seq_start=seq, recorded=recorded
+            )
+            steps.extend(extra)
+            text_only = ""
+            if isinstance(msg.content, list):
+                parts = [
+                    str(b.get("text"))
+                    for b in msg.content
+                    if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+                ]
+                text_only = "\n".join(parts).strip()
+            elif isinstance(msg.content, str):
+                text_only = msg.content.strip()
+            if text_only:
+                seq += 1
+                steps.append(
+                    Step(
+                        trajectory_id=traj_id,
+                        seq=seq,
+                        kind=StepKind.THOUGHT,
+                        summary=text_only[:500],
+                        payload={"role": "assistant"},
+                        recorded_at=recorded,
+                    )
+                )
+            continue
+
+        if role == "user" and _has_block_type(msg, "tool_result"):
+            extra, seq = _anthropic_tool_result_steps(
+                traj_id, msg, seq_start=seq, recorded=recorded
+            )
+            steps.extend(extra)
+            if isinstance(msg.content, list):
+                text_parts = [
+                    str(b.get("text"))
+                    for b in msg.content
+                    if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+                ]
+                if text_parts:
+                    seq += 1
+                    steps.append(
+                        Step(
+                            trajectory_id=traj_id,
+                            seq=seq,
+                            kind=StepKind.NOTE,
+                            summary="\n".join(text_parts)[:500],
+                            payload={"role": "user", "block_types": ["text", "tool_result"]},
+                            recorded_at=recorded,
+                        )
+                    )
+            continue
+
+        seq += 1
+        text = ir_message_text(msg).strip()
+        if role == "user":
+            kind = StepKind.NOTE
+        elif role == "assistant":
+            kind = StepKind.THOUGHT
+        elif role == "tool":
+            kind = StepKind.TOOL_RESULT
+        else:
+            kind = StepKind.OTHER
+        steps.append(
+            Step(
+                trajectory_id=traj_id,
+                seq=seq,
+                kind=kind,
+                summary=(text[:500] if text else f"{role} message"),
+                payload={"role": role, "raw_id": msg.msg_id},
+                recorded_at=recorded,
+            )
+        )
+    return steps
+
+
 def map_conversation_ir_legacy(ir: ConversationIR) -> MappedTrajectory:
-    """Legacy single-trajectory map (one IR → one trajectory). Used by Phase 1 tests/import."""
+    """Legacy single-trajectory map (one IR → one trajectory). Tests/smoke only."""
+    _warn_legacy_once("map_conversation_ir_legacy")
     external_id = ir.request_id
     title = (ir.title or "untitled").strip()
     project = (ir.project or "").strip()
@@ -256,124 +407,7 @@ def map_conversation_ir_legacy(ir: ConversationIR) -> MappedTrajectory:
         finalized_at=updated_at if status != TrajectoryStatus.OPEN else None,
     )
 
-    steps: list[Step] = []
-    seq = 0
-    for msg in messages:
-        recorded = msg.timestamp or created_at
-        role = msg.role
-
-        # Fixture OpenAI-style tool_calls on assistant
-        if msg.tool_calls and role == "assistant":
-            for tc in msg.tool_calls:
-                seq += 1
-                name = ""
-                if isinstance(tc, dict):
-                    fn = tc.get("function") or {}
-                    name = fn.get("name") or tc.get("name") or "tool"
-                steps.append(
-                    Step(
-                        trajectory_id=traj_id,
-                        seq=seq,
-                        kind=StepKind.TOOL_CALL,
-                        summary=f"tool_call: {name}",
-                        payload={"tool_call": tc},
-                        recorded_at=recorded,
-                    )
-                )
-            text = ir_message_text(msg).strip()
-            if text:
-                seq += 1
-                steps.append(
-                    Step(
-                        trajectory_id=traj_id,
-                        seq=seq,
-                        kind=StepKind.THOUGHT,
-                        summary=text[:500],
-                        payload={"role": "assistant"},
-                        recorded_at=recorded,
-                    )
-                )
-            continue
-
-        # Anthropic proxy: tool_use / tool_result blocks
-        if role == "assistant" and _has_block_type(msg, "tool_use"):
-            extra, seq = _anthropic_tool_use_steps(
-                traj_id, msg, seq_start=seq, recorded=recorded
-            )
-            steps.extend(extra)
-            text = ir_message_text(msg).strip()
-            # only pure text (ir_message_text may include only text blocks)
-            text_only = ""
-            if isinstance(msg.content, list):
-                parts = [
-                    str(b.get("text"))
-                    for b in msg.content
-                    if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
-                ]
-                text_only = "\n".join(parts).strip()
-            elif isinstance(msg.content, str):
-                text_only = msg.content.strip()
-            if text_only:
-                seq += 1
-                steps.append(
-                    Step(
-                        trajectory_id=traj_id,
-                        seq=seq,
-                        kind=StepKind.THOUGHT,
-                        summary=text_only[:500],
-                        payload={"role": "assistant"},
-                        recorded_at=recorded,
-                    )
-                )
-            continue
-
-        if role == "user" and _has_block_type(msg, "tool_result"):
-            extra, seq = _anthropic_tool_result_steps(
-                traj_id, msg, seq_start=seq, recorded=recorded
-            )
-            steps.extend(extra)
-            # optional accompanying user text goal
-            if isinstance(msg.content, list):
-                text_parts = [
-                    str(b.get("text"))
-                    for b in msg.content
-                    if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
-                ]
-                if text_parts:
-                    seq += 1
-                    steps.append(
-                        Step(
-                            trajectory_id=traj_id,
-                            seq=seq,
-                            kind=StepKind.NOTE,
-                            summary="\n".join(text_parts)[:500],
-                            payload={"role": "user", "block_types": ["text", "tool_result"]},
-                            recorded_at=recorded,
-                        )
-                    )
-            continue
-
-        seq += 1
-        text = ir_message_text(msg).strip()
-        if role == "user":
-            kind = StepKind.NOTE
-        elif role == "assistant":
-            kind = StepKind.THOUGHT
-        elif role == "tool":
-            kind = StepKind.TOOL_RESULT
-        else:
-            kind = StepKind.OTHER
-        steps.append(
-            Step(
-                trajectory_id=traj_id,
-                seq=seq,
-                kind=kind,
-                summary=(text[:500] if text else f"{role} message"),
-                payload={"role": role, "raw_id": msg.msg_id},
-                recorded_at=recorded,
-            )
-        )
-
+    steps = messages_to_steps(traj_id, messages, created_at=created_at)
     trajectory = trajectory.model_copy(
         update={"progress": progress.model_copy(update={"steps_count": len(steps)})}
     )
@@ -381,7 +415,8 @@ def map_conversation_ir_legacy(ir: ConversationIR) -> MappedTrajectory:
 
 
 def map_mongo_conversation_doc(doc: dict[str, Any]) -> MappedTrajectory:
-    """Map a claude_conversations.conversations-style document (dual-shape via normalizer)."""
+    """Deprecated: one-doc map for tests only. Prefer hierarchical session import."""
+    _warn_legacy_once("map_mongo_conversation_doc")
     ir = normalize_mongo_doc(doc)
     return map_conversation_ir_legacy(ir)
 
@@ -406,36 +441,10 @@ def _build_steps_for_messages(
     created_at: datetime,
     seq_offset: int = 0,
 ) -> list[Step]:
-    """Reuse legacy step extraction on a message slice by temporarily mapping via IR."""
-    # Lightweight: call through pseudo-IR legacy for slice by building temporary steps
-    pseudo = ConversationIR(
-        session_id=None,
-        request_id=traj_id,
-        model=None,
-        created_at=created_at,
-        updated_at=created_at,
-        title=None,
-        project=None,
-        tags=[],
-        system_text="",
-        tool_names=[],
-        messages=messages,
-        usage=None,
-        source_shape="fixture_v1",
-        raw_external={},
+    """Hierarchical segment step builder — uses shared messages_to_steps (no pseudo-IR)."""
+    return messages_to_steps(
+        traj_id, messages, created_at=created_at, seq_offset=seq_offset
     )
-    mapped = map_conversation_ir_legacy(pseudo)
-    steps: list[Step] = []
-    for s in mapped.steps:
-        steps.append(
-            s.model_copy(
-                update={
-                    "trajectory_id": traj_id,
-                    "seq": s.seq + seq_offset,
-                }
-            )
-        )
-    return steps
 
 
 def map_session_hierarchy(

@@ -92,3 +92,116 @@ def test_token_overlap_positive():
         "Fix Qdrant embedding dimension mismatch",
     )
     assert s > 0.05
+
+
+def _lab_cfg(**kwargs) -> GateConfig:
+    """Lab-mode-like gates: exclude archive tags, weak/no lexical gate."""
+    defaults = dict(
+        exclude_tags_enabled=True,
+        reject_noisy_task=True,
+        min_token_overlap=0.0,
+        require_overlap_if_no_shared_tokens=False,
+        respect_explicit_tags_any=True,
+    )
+    defaults.update(kwargs)
+    return GateConfig(**defaults)
+
+
+def test_experience_grade_alone_passes_lab_without_hydration_tags():
+    """Authored experience_grade without archive tags is kept in lab gates."""
+    hits = [
+        _hit(
+            "good",
+            "Fix Qdrant collection embedding dimension with vLLM embed model",
+            ["session_segment", "experience_grade", "author_segmented"],
+            0.05,
+        ),
+    ]
+    # stamp external_refs grade flag as writers do
+    hits[0] = hits[0].model_copy(
+        update={"external_refs": {"experience_grade": True, "owner": "alice"}}
+    )
+    out = apply_retrieval_gates(
+        hits,
+        query_task="Fix Qdrant embedding dimension mismatch",
+        config=_lab_cfg(),
+    )
+    assert [h.trajectory_id for h in out.hits] == ["good"]
+
+
+def test_experience_grade_cannot_launder_hydration_tags_lab():
+    """experience_grade=true must NOT override hydration/archive excludes in lab."""
+    for bad_tag in ("hydration_test", "external_pre_embed", "not_author_segmented"):
+        hits = [
+            _hit(
+                "launder",
+                "Fix Qdrant collection embedding dimension with vLLM embed model",
+                ["session_segment", "experience_grade", bad_tag],
+                0.09,
+            ),
+        ]
+        hits[0] = hits[0].model_copy(
+            update={"external_refs": {"experience_grade": True, "owner": "bob"}}
+        )
+        out = apply_retrieval_gates(
+            hits,
+            query_task="Fix Qdrant embedding dimension mismatch",
+            config=_lab_cfg(),
+        )
+        assert out.hits == [], f"expected drop for tag {bad_tag}"
+        assert any(
+            "excluded_tags" in r
+            for d in out.dropped
+            for r in d.get("reasons", [])
+        )
+        assert any(
+            "experience_grade_no_override" in r
+            for d in out.dropped
+            for r in d.get("reasons", [])
+        )
+
+
+def test_experience_grade_flag_only_external_refs_still_blocked_with_hydration():
+    """Grade only in external_refs (no experience_grade tag) still cannot launder."""
+    hits = [
+        _hit(
+            "x",
+            "Implement Qdrant embed dimension fix for collection mismatch",
+            ["session_segment", "hydration_test", "external_pre_embed"],
+            0.08,
+        ),
+    ]
+    hits[0] = hits[0].model_copy(update={"external_refs": {"experience_grade": True}})
+    out = apply_retrieval_gates(
+        hits,
+        query_task="Qdrant embed dimension collection mismatch",
+        config=_lab_cfg(),
+    )
+    assert out.hits == []
+
+
+def test_explicit_tags_any_can_opt_into_archive_not_via_grade():
+    """Caller tags_any including exclude tag opts in; grade alone does not."""
+    hits = [
+        _hit(
+            "arch",
+            "Implement Qdrant embed dimension fix for collection mismatch",
+            ["session_segment", "hydration_test", "experience_grade"],
+            0.07,
+        ),
+    ]
+    # Without tags_any opt-in → blocked
+    blocked = apply_retrieval_gates(
+        hits,
+        query_task="Qdrant embed dimension",
+        config=_lab_cfg(),
+    )
+    assert blocked.hits == []
+    # With explicit archive tag in tags_any → kept
+    allowed = apply_retrieval_gates(
+        hits,
+        query_task="Qdrant embed dimension",
+        tags_any=["hydration_test"],
+        config=_lab_cfg(),
+    )
+    assert [h.trajectory_id for h in allowed.hits] == ["arch"]

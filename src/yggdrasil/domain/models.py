@@ -8,7 +8,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from yggdrasil.domain.artifacts import ArtifactRef
-from yggdrasil.domain.enums import EffortPredicateOp, IndexState, StepKind, TrajectoryStatus
+from yggdrasil.domain.enums import EffortPredicateOp, IndexStatus, StepKind, TrajectoryStatus
 
 
 class RuntimeFingerprint(BaseModel):
@@ -127,10 +127,15 @@ class Trajectory(BaseModel):
     outcome: Outcome | None = None
     effort: EffortLedger = Field(default_factory=EffortLedger)
     embed_view_version: str = "coding_v1"
-    index_state: IndexState = IndexState.PENDING
+    index_status: IndexStatus = IndexStatus.PENDING
     created_at: datetime
     updated_at: datetime
     finalized_at: datetime | None = None
+
+    @property
+    def index_state(self) -> IndexStatus:
+        """Back-compat alias for index_status."""
+        return self.index_status
 
 
 class EffortPredicate(BaseModel):
@@ -173,5 +178,10 @@ class SearchHit(BaseModel):
     workspace: str | None = None
     scores: SearchScores | None = None
     score: float | None = None
-    index_state: IndexState | None = None
+    index_status: IndexStatus | None = None
     embed_view_version: str | None = None
+
+    @property
+    def index_state(self) -> IndexStatus | None:
+        """Back-compat alias for index_status."""
+        return self.index_status

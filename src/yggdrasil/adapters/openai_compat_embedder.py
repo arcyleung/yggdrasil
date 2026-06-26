@@ -84,6 +84,12 @@ class OpenAICompatEmbedder:
             raise EmbedFailedError(
                 f"embed count mismatch: expected {len(texts)}, got {len(vectors)}"
             )
+        for i, vec in enumerate(vectors):
+            if len(vec) != self._dimensions:
+                raise EmbedFailedError(
+                    f"embed dimension mismatch at index {i}: got {len(vec)}, "
+                    f"expected {self._dimensions}"
+                )
         return vectors
 
     def embed_one(self, text: str) -> list[float]:

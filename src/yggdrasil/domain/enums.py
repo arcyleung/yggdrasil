@@ -24,11 +24,41 @@ class StepKind(str, Enum):
     OTHER = "other"
 
 
-class IndexState(str, Enum):
+class IndexStatus(str, Enum):
+    """Dual-store index health for a trajectory (SQLite SoT + vector index).
+
+    pending — not yet successfully upserted to the vector index
+    ready   — vector index reflects current SQLite trajectory payload
+    stale   — was ready; subsequent embed/index attempt failed (payload may be outdated)
+    failed  — embed/index never succeeded (or hard failure on start)
+    """
+
     PENDING = "pending"
-    INDEXED = "indexed"
+    READY = "ready"
     STALE = "stale"
-    ERROR = "error"
+    FAILED = "failed"
+
+
+# Back-compat alias (pre-Wave-C name/values). Prefer IndexStatus in new code.
+IndexState = IndexStatus
+
+# Legacy string values that may exist in older SQLite DBs / payloads.
+_INDEX_STATUS_LEGACY: dict[str, IndexStatus] = {
+    "indexed": IndexStatus.READY,
+    "error": IndexStatus.FAILED,
+}
+
+
+def coerce_index_status(raw: str | IndexStatus | None) -> IndexStatus:
+    """Parse index status, mapping legacy indexed/error values."""
+    if raw is None:
+        return IndexStatus.PENDING
+    if isinstance(raw, IndexStatus):
+        return raw
+    key = str(raw).strip().lower()
+    if key in _INDEX_STATUS_LEGACY:
+        return _INDEX_STATUS_LEGACY[key]
+    return IndexStatus(key)
 
 
 class EmbedAspect(str, Enum):
