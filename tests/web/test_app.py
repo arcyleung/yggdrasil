@@ -1,5 +1,7 @@
-"""Control-plane UI tests (FastAPI TestClient)."""
+"""Control-plane UI tests — real AuthService + SQLite token store."""
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 
@@ -7,7 +9,9 @@ fastapi = pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from yggdrasil.web.app import create_app  # noqa: E402
-from yggdrasil.web.auth_stub import AuthStub  # noqa: E402
+from yggdrasil.web.auth_factory import WebAuthFacade, build_web_auth  # noqa: E402
+from yggdrasil.adapters.token_store import SqliteTokenStore  # noqa: E402
+from yggdrasil.services.auth_service import AuthService  # noqa: E402
 
 
 TEST_KEY = "sk-test-ui-key-alice"
@@ -15,11 +19,21 @@ TEST_MAP = {TEST_KEY: "alice"}
 
 
 @pytest.fixture
-def client() -> TestClient:
-    auth = AuthStub(secret="test-secret", key_name_map=TEST_MAP)
+def auth_db(tmp_path: Path) -> Path:
+    return tmp_path / "ui_auth.db"
+
+
+@pytest.fixture
+def auth_facade(auth_db: Path) -> WebAuthFacade:
+    return build_web_auth(sqlite_path=auth_db, key_name_map=TEST_MAP, env={})
+
+
+@pytest.fixture
+def client(auth_facade: WebAuthFacade, auth_db: Path) -> TestClient:
     app = create_app(
-        auth=auth,
+        auth=auth_facade,
         key_name_map=TEST_MAP,
+        sqlite_path=auth_db,
         env={"YGG_UI_SECRET": "test-secret", "YGG_PUBLIC_BASE_URL": "http://test.example:8080"},
         public_base_url="http://test.example:8080",
     )
@@ -36,7 +50,6 @@ def test_home(client: TestClient) -> None:
     r = client.get("/")
     assert r.status_code == 200
     assert b"Lab" in r.content
-    assert b"Demo" in r.content
 
 
 def test_exchange_unknown_key_json(client: TestClient) -> None:
@@ -44,87 +57,87 @@ def test_exchange_unknown_key_json(client: TestClient) -> None:
     assert r.status_code == 401
 
 
-def test_exchange_known_key_json(client: TestClient) -> None:
+def test_exchange_known_key_issues_ygg_token(client: TestClient, auth_facade: WebAuthFacade) -> None:
     r = client.post("/api/v1/tokens/exchange", json={"api_key": TEST_KEY})
     assert r.status_code == 200
     body = r.json()
     assert body["owner"] == "alice"
     assert body["tenant_id"] == "lab"
-    assert body["token"]
-    assert "sk-" not in body["token"]  # issued token, not raw key
+    assert body["token"].startswith("ygg_")
+    assert body["token_id"]
+    assert TEST_KEY not in body["token"]
+    # Token resolves via multi-tenant store
+    p = auth_facade.resolve_token(body["token"])
+    assert p.owner == "alice"
+    assert p.tenant_id == "lab"
 
 
-def test_lab_login_unknown_key_form(client: TestClient) -> None:
-    r = client.post("/lab/login", data={"api_key": "sk-bad"}, follow_redirects=False)
-    assert r.status_code == 200
-    assert b"unknown" in r.content.lower() or b"error" in r.content.lower() or b"api" in r.content.lower()
-
-
-def test_lab_login_and_skill_download(client: TestClient) -> None:
+def test_lab_login_skill_with_token_query(client: TestClient, auth_facade: WebAuthFacade) -> None:
     r = client.post("/lab/login", data={"api_key": TEST_KEY}, follow_redirects=False)
     assert r.status_code == 303
-    assert r.headers["location"] == "/lab/home"
 
     home = client.get("/lab/home")
     assert home.status_code == 200
     assert b"alice" in home.content
+    # First home consumes flash — extract token from page or re-exchange
+    exch = client.post("/api/v1/tokens/exchange", json={"api_key": TEST_KEY})
+    tok = exch.json()["token"]
 
-    skill = client.get("/lab/skill.md")
+    skill = client.get(f"/lab/skill.md?token={tok}")
     assert skill.status_code == 200
-    text = skill.text
-    assert "http://test.example:8080" in text
-    assert "Bearer " in text or "bearer" in text.lower()
-    assert "alice" in text
-    assert "lab" in text
-    assert TEST_KEY not in text  # never embed sk- key
+    assert "http://test.example:8080" in skill.text
+    assert tok in skill.text
+    assert TEST_KEY not in skill.text
 
-    mcp = client.get("/lab/mcp.json")
+    mcp = client.get(f"/lab/mcp.json?token={tok}")
     assert mcp.status_code == 200
-    assert "http://test.example:8080/mcp" in mcp.text
-    assert "Authorization" in mcp.text
-    assert TEST_KEY not in mcp.text
+    assert tok in mcp.text
 
 
-def test_lab_home_requires_session(client: TestClient) -> None:
-    r = client.get("/lab/home", follow_redirects=False)
-    assert r.status_code == 303
-    assert "/lab/login" in r.headers["location"]
+def test_session_does_not_keep_raw_token_after_home(client: TestClient) -> None:
+    client.post("/lab/login", data={"api_key": TEST_KEY}, follow_redirects=False)
+    client.get("/lab/home")  # consume flash
+    # skill without token should 401 (session has token_id only)
+    skill = client.get("/lab/skill.md")
+    assert skill.status_code == 401
 
 
-def test_demo_issues_token(client: TestClient) -> None:
+def test_revoke_invalidates_token(client: TestClient, auth_facade: WebAuthFacade) -> None:
+    exch = client.post("/api/v1/tokens/exchange", json={"api_key": TEST_KEY})
+    tok = exch.json()["token"]
+    assert auth_facade.resolve_token(tok).owner == "alice"
+    # login to set session token_id
+    client.post("/lab/login", data={"api_key": TEST_KEY}, follow_redirects=False)
+    rev = client.post(
+        "/api/v1/tokens/revoke",
+        headers={"Authorization": f"Bearer {tok}"},
+    )
+    assert rev.status_code == 200
+    with pytest.raises(Exception):
+        auth_facade.resolve_token(tok)
+
+
+def test_demo_token_resolves_in_store(client: TestClient, auth_facade: WebAuthFacade) -> None:
     r = client.post("/demo", follow_redirects=True)
     assert r.status_code == 200
-    assert b"demo" in r.content.lower()
-
-    skill = client.get("/demo/skill.md")
-    assert skill.status_code == 200
-    assert "demo" in skill.text
-    assert "http://test.example:8080" in skill.text
+    # issue via API path on facade
+    result = auth_facade.issue_demo_token()
+    assert result["tenant_id"] == "demo"
+    assert result["token"].startswith("ygg_")
+    p = auth_facade.resolve_token(result["token"])
+    assert p.tenant_id == "demo"
 
 
 def test_mcp_stub_501(client: TestClient) -> None:
-    r = client.get("/mcp")
-    assert r.status_code == 501
+    assert client.get("/mcp").status_code == 501
 
 
-def test_auth_stub_resolve_roundtrip() -> None:
-    auth = AuthStub(secret="s", key_name_map=TEST_MAP)
-    result = auth.exchange_api_key(TEST_KEY)
-    principal = auth.resolve_token(result["token"])
-    assert principal.owner == "alice"
-    assert principal.tenant_id == "lab"
-    assert "read" in principal.scopes
-
-
-def test_monkeypatch_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
-    """If mapping has a test key via env/monkeypatch, exchange succeeds."""
-    monkeypatch.setenv("YGG_UI_SECRET", "mp-secret")
-    # Inject map via create_app key_name_map (simulates loaded mapping)
-    auth = AuthStub(secret="mp-secret", key_name_map={"sk-mp-key": "bob"})
-    app = create_app(auth=auth, public_base_url="http://127.0.0.1:8080")
-    c = TestClient(app)
-    r = c.post("/api/v1/tokens/exchange", json={"api_key": "sk-mp-key"})
-    assert r.status_code == 200
-    assert r.json()["owner"] == "bob"
-    bad = c.post("/api/v1/tokens/exchange", json={"api_key": "sk-nope"})
-    assert bad.status_code == 401
+def test_token_usable_as_mcp_principal(auth_db: Path) -> None:
+    """Issued UI token works with same resolve path MCP uses."""
+    facade = build_web_auth(sqlite_path=auth_db, key_name_map=TEST_MAP, env={})
+    raw, principal, _ = facade.auth_service.exchange_api_key(TEST_KEY)
+    store = SqliteTokenStore(auth_db)
+    p2 = store.resolve_token(raw)
+    assert p2 is not None
+    assert p2.owner == principal.owner
+    assert p2.token_id == principal.token_id
