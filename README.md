@@ -190,8 +190,15 @@ PYTHONPATH=src python scripts/smoke_normalize_mongo.py   # fixture dual-shape no
 
 ## Security
 
-- Do not commit `.env` or `mongo_creds.txt`.
-- Trajectories may contain secrets from agent context; local trust model in PoC.
+**Threat model (trusted PoC only)** — see [`docs/superpowers/specs/2026-06-25-threat-model-poc.md`](docs/superpowers/specs/2026-06-25-threat-model-poc.md):
+
+- **In scope:** single local operator, trusted MCP clients/agents on a private network, SQLite + Qdrant under operator control.
+- **Out of scope:** hostile multi-tenant use, malicious agents, Qdrant exposed on the public internet, formal compliance/PII guarantees.
+- **Trajectories may contain secrets and PII** copied from agent context (prompts, tool output, credentials in text). Storage is **not** proof of scrubbing.
+- **`owner` / `agent_id` are attribution fields**, not evidence that content was redacted. Optional regex scrubbing is off by default (`YGG_SCRUB_CONTENT=0`); set to `1` for best-effort email/`sk-`/`Bearer` redaction while preserving allowlisted owner names exactly.
+- Do not commit `.env`, `mongo_creds.txt`, or `user_mapping.yaml`.
+- If `docker-compose` Qdrant ports are reachable beyond localhost, set `QDRANT_API_KEY` (compose passes `QDRANT__SERVICE__API_KEY` when set).
+- Multi-tenant authz is **not** implemented; blockers are tracked in [`docs/superpowers/plans/2026-06-25-multi-tenant-authz-FOLLOWON.md`](docs/superpowers/plans/2026-06-25-multi-tenant-authz-FOLLOWON.md).
 
 ## Config
 

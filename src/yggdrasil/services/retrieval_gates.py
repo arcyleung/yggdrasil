@@ -113,6 +113,19 @@ def token_overlap_score(query_task: str | None, hit_task: str | None) -> float:
     return inter / union if union else 0.0
 
 
+def hit_claims_experience_grade(hit: SearchHit) -> bool:
+    """True if payload/tags claim authored experience_grade trust.
+
+    This flag alone is **never** sufficient to pass lab/agent gates when
+    hydration/archive provenance tags are also present.
+    """
+    tags = set(hit.tags or [])
+    if "experience_grade" in tags or "author_segmented" in tags:
+        return True
+    refs = hit.external_refs or {}
+    return bool(refs.get("experience_grade"))
+
+
 @dataclass
 class GateConfig:
     """Defaults match production agent skill gates; importers/eval can relax."""
@@ -121,6 +134,8 @@ class GateConfig:
     exclude_tags_enabled: bool = True
     # If True, exclude_tags only applied when agent did not pass tags_any including them
     respect_explicit_tags_any: bool = True
+    # experience_grade tag/flag must never launder hydration/archive excludes (Wave D)
+    experience_grade_cannot_override_excludes: bool = True
     reject_noisy_task: bool = True
     min_token_overlap: float = 0.02  # weak; 0 disables lexical gate
     require_overlap_if_no_shared_tokens: bool = True
@@ -145,13 +160,23 @@ def apply_retrieval_gates(
     tags_any: list[str] | None = None,
     config: GateConfig | None = None,
 ) -> GatedSearchResult:
-    """Filter/reorder hits per skill gates. Does not re-query Qdrant."""
+    """Filter/reorder hits per skill gates. Does not re-query Qdrant.
+
+    Trust rules (lab and agent):
+    - Tags ``hydration_test``, ``external_pre_embed``, ``not_author_segmented`` are
+      excluded when ``exclude_tags_enabled`` (default on unless ``include_archive``).
+    - ``experience_grade=true`` (tag or external_refs) **cannot** override those
+      excludes — graded hydration corpus is still archive noise.
+    - Only an explicit caller ``tags_any`` that intersects exclude_tags opts in
+      (archive forensics), and only when ``respect_explicit_tags_any`` is True.
+    """
     cfg = config or GateConfig()
     dropped: list[dict[str, Any]] = []
     kept: list[SearchHit] = []
     warnings: list[str] = []
 
     explicit_tags = set(tags_any or [])
+    # Caller must name an exclude tag in tags_any to opt into archive — never via grade alone
     skip_exclude = cfg.respect_explicit_tags_any and bool(
         explicit_tags & set(cfg.exclude_tags)
     )
@@ -160,11 +185,16 @@ def apply_retrieval_gates(
         reasons: list[str] = []
         tags = set(h.tags or [])
         task = (h.task_text or "").strip()
+        graded = hit_claims_experience_grade(h)
 
         if cfg.exclude_tags_enabled and not skip_exclude:
             bad = tags & cfg.exclude_tags
             if bad:
-                reasons.append(f"excluded_tags:{','.join(sorted(bad))}")
+                reason = f"excluded_tags:{','.join(sorted(bad))}"
+                # Explicit laundering guard: grade does not clear hydration provenance
+                if graded and cfg.experience_grade_cannot_override_excludes:
+                    reason += "+experience_grade_no_override"
+                reasons.append(reason)
 
         if cfg.reject_noisy_task and task_is_noisy(task):
             reasons.append("noisy_or_short_task_text")

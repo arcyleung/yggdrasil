@@ -52,6 +52,15 @@ Conceptually this is **`search_experience`** (via MCP `search_strategies`) plus 
 
 Search does **not** require an open trajectory. Empty gated results mean “no trusted prior experience”—proceed normally; do not treat unfiltered archive noise as success.
 
+### Trust gates: `search_mode` and `experience_grade`
+
+| Mode | Intent | Provenance excludes (`hydration_test`, `external_pre_embed`, `not_author_segmented`) | Lexical overlap |
+|------|--------|--------------------------------------------------------------------------------------|-----------------|
+| **`agent`** (default) | Strict strategy recall for the current agent | Always excluded unless you opt into archive via explicit `tags_any` | Weak min token overlap on |
+| **`lab`** | Org-wide / team forensics; prefers `experience_grade` authored memory | **Same excludes** — lab is not a back door into hydration corpus | Overlap relaxed (often off) |
+
+**Critical:** `experience_grade=true` (tag or `external_refs`) marks *author-segmented* team memory. It **does not** launder trust for trajectories that also carry hydration/archive tags. A graded pre-embed row is still gated out in both modes. Empty gated results are correct when only archive noise matched.
+
 ---
 
 ## Core policies (critical)

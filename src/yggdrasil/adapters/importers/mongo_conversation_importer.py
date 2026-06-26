@@ -1,7 +1,8 @@
-"""Idempotent Mongo conversation importer into TrajectoryStore (legacy + hierarchical)."""
+"""Idempotent Mongo conversation importer into TrajectoryStore (hierarchical primary)."""
 from __future__ import annotations
 
 import logging
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -102,7 +103,16 @@ class MongoConversationImporter:
         reembed: bool = False,
         dry_run: bool = False,
     ) -> MappedTrajectory:
-        """Legacy: one doc → one trajectory (no hierarchy)."""
+        """Deprecated legacy path: one doc → one trajectory (no hierarchy).
+
+        Prefer ``import_session_aggregate`` / ``import_docs_as_sessions``.
+        """
+        warnings.warn(
+            "MongoConversationImporter.import_doc is deprecated; use hierarchical "
+            "import_docs_as_sessions / import_session_aggregate (Wave E).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         mapped = map_mongo_conversation_doc(doc)
         return self._persist_mapped(mapped, reembed=reembed, dry_run=dry_run)
 
@@ -248,45 +258,30 @@ class MongoConversationImporter:
         reembed: bool = False,
         dry_run: bool = False,
         limit: int | None = None,
-        hierarchical: bool = False,
+        hierarchical: bool = True,
         limit_sessions: int | None = None,
         embed_parent: bool = False,
     ) -> ImportStats:
-        if hierarchical:
-            limited_docs: list[dict[str, Any]] = []
-            for i, doc in enumerate(docs):
-                if limit is not None and i >= limit:
-                    break
-                limited_docs.append(doc)
-            return self.import_docs_as_sessions(
-                limited_docs,
-                reembed=reembed,
-                dry_run=dry_run,
-                limit_sessions=limit_sessions,
-                embed_parent=embed_parent,
-            )
+        """Import Mongo docs. Hierarchical session path is the only supported ingress.
 
-        stats = ImportStats()
-        for doc in docs:
-            if limit is not None and stats.seen >= limit:
+        ``hierarchical=False`` raises ``SystemExit`` (Wave E deprecation).
+        """
+        if not hierarchical:
+            raise SystemExit(
+                "Non-hierarchical mongo import is removed (Wave E). "
+                "Use hierarchical=True (default) or import_docs_as_sessions / "
+                "scripts/import_mongo_sessions.py. Legacy one-doc mapping remains "
+                "only as a test helper (map_mongo_conversation_doc)."
+            )
+        limited_docs: list[dict[str, Any]] = []
+        for i, doc in enumerate(docs):
+            if limit is not None and i >= limit:
                 break
-            stats.seen += 1
-            try:
-                external_id = None
-                doc_id = doc.get("_id")
-                if isinstance(doc_id, dict) and "$oid" in doc_id:
-                    external_id = str(doc_id["$oid"])
-                elif doc_id is not None:
-                    external_id = str(doc_id)
-                existed = False
-                if external_id:
-                    existed = self._store.find_by_external_ref("mongo", external_id) is not None
-                self.import_doc(doc, reembed=reembed, dry_run=dry_run)
-                if existed:
-                    stats.updated += 1
-                else:
-                    stats.imported += 1
-            except Exception as exc:
-                stats.errors.append(str(exc))
-                stats.skipped += 1
-        return stats
+            limited_docs.append(doc)
+        return self.import_docs_as_sessions(
+            limited_docs,
+            reembed=reembed,
+            dry_run=dry_run,
+            limit_sessions=limit_sessions,
+            embed_parent=embed_parent,
+        )

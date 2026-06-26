@@ -50,7 +50,12 @@ class AppContext:
         index.ensure_collection(vector_size=cfg.embed_dim)
         view = get_embed_view(cfg.embed_view_version)
         embed_service = EmbedService(embedder, index, view, cfg)
-        session_service = SessionService(store, embed_service)
+        scrubber = None
+        if cfg.scrub_content:
+            from yggdrasil.adapters.regex_scrubber import RegexContentScrubber
+
+            scrubber = RegexContentScrubber()
+        session_service = SessionService(store, embed_service, scrubber=scrubber)
         search_service = SearchService(store, embedder, index, view, cfg)
         return cls(
             config=cfg,

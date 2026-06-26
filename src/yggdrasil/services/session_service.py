@@ -1,11 +1,12 @@
 """Session lifecycle orchestration over store + embed."""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 from yggdrasil.domain.artifacts import ArtifactRef, normalize_artifacts
 from yggdrasil.domain.enums import IndexStatus, StepKind, TrajectoryStatus
 from yggdrasil.domain.models import EffortLedger, Outcome, Progress, RuntimeFingerprint, Step, Trajectory
+from yggdrasil.ports.scrubber import ContentScrubber
 from yggdrasil.ports.store import (
     AppendStepInput,
     CreateTrajectoryInput,
@@ -36,12 +37,37 @@ class SessionService:
     3. On success → index_status=ready.
     4. On failure → index_status=failed (or stale if previously ready);
        start_trajectory hard-fails (raises) after marking failed.
+
+    Optional content scrubbing (``YGG_SCRUB_CONTENT=1``): when a ContentScrubber
+    is provided, scrub task/scaffold/summary text before persist; owner names in
+    external_refs are allowlisted and preserved exactly.
     """
 
-    def __init__(self, store: TrajectoryStore, embed_service: EmbedService) -> None:
+    def __init__(
+        self,
+        store: TrajectoryStore,
+        embed_service: EmbedService,
+        *,
+        scrubber: ContentScrubber | None = None,
+    ) -> None:
         self._store = store
         self._embed = embed_service
+        self._scrubber = scrubber
         self._vector_cache: dict[str, NamedVectors] = {}
+
+    def _allowed_names(self, external_refs: dict[str, Any] | None) -> list[str]:
+        refs = external_refs or {}
+        names: list[str] = []
+        for key in ("owner", "agent_id", "team"):
+            val = refs.get(key)
+            if isinstance(val, str) and val.strip():
+                names.append(val.strip())
+        return names
+
+    def _scrub(self, text: str | None, *, allowed_names: Sequence[str] = ()) -> str | None:
+        if text is None or self._scrubber is None:
+            return text
+        return self._scrubber.scrub_text(text, allowed_names=allowed_names)
 
     def _map_store_error(self, exc: Exception) -> Exception:
         if isinstance(exc, StoreTrajectoryNotFoundError):
@@ -99,6 +125,11 @@ class SessionService:
         if not scaffold_text or not scaffold_text.strip():
             raise ValidationError("scaffold_text is required")
 
+        refs = dict(external_refs or {})
+        allowed = self._allowed_names(refs)
+        task_text = self._scrub(task_text, allowed_names=allowed) or task_text
+        scaffold_text = self._scrub(scaffold_text, allowed_names=allowed) or scaffold_text
+
         fp = runtime_fingerprint
         if isinstance(fp, dict):
             fp = RuntimeFingerprint.model_validate(fp)
@@ -118,7 +149,7 @@ class SessionService:
                     scaffold_text=scaffold_text,
                     runtime_fingerprint=fp,
                     tags=list(tags or []),
-                    external_refs=dict(external_refs or {}),
+                    external_refs=refs,
                     artifacts=normalize_artifacts(artifacts),
                     progress=prog,
                     effort=eff,
@@ -155,6 +186,20 @@ class SessionService:
         eff = effort_delta
         if isinstance(eff, dict):
             eff = EffortLedger.model_validate(eff)
+
+        # Allowlist owner from existing trajectory when scrubbing is on
+        allowed: list[str] = []
+        if self._scrubber is not None:
+            try:
+                existing = self._store.get(trajectory_id)
+                allowed = self._allowed_names(existing.external_refs)
+            except Exception:
+                allowed = []
+            summary = self._scrub(summary, allowed_names=allowed) or summary
+            if scaffold_update is not None:
+                scaffold_update = self._scrub(scaffold_update, allowed_names=allowed)
+            if task_update is not None:
+                task_update = self._scrub(task_update, allowed_names=allowed)
 
         try:
             traj, step = self._store.append_step(

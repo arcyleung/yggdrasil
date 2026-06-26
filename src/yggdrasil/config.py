@@ -35,6 +35,8 @@ class YggConfig:
     embed_view_version: str
     mongo_uri: str | None
     mongo_creds_file: Path
+    # Wave F: optional regex content scrub on write (default off for backward compat)
+    scrub_content: bool = False
 
 
 def _env_get(env: Mapping[str, str], key: str, default: str | None = None) -> str | None:
@@ -126,6 +128,9 @@ def load_config(
     include_open_raw = _env_get(env, "YGG_SEARCH_INCLUDE_OPEN", "true") or "true"
     search_include_open = _parse_bool(include_open_raw, field_name="YGG_SEARCH_INCLUDE_OPEN")
 
+    scrub_raw = _env_get(env, "YGG_SCRUB_CONTENT", "0") or "0"
+    scrub_content = _parse_bool(scrub_raw, field_name="YGG_SCRUB_CONTENT")
+
     qdrant_url = (_env_get(env, "QDRANT_URL", "http://localhost:6333") or "").strip()
     if not qdrant_url:
         raise ConfigError("QDRANT_URL must be non-empty")
@@ -163,6 +168,7 @@ def load_config(
         mongo_creds_file=Path(
             _env_get(env, "YGG_MONGO_CREDS_FILE", "mongo_creds.txt") or "mongo_creds.txt"
         ),
+        scrub_content=scrub_content,
     )
 
 
@@ -182,6 +188,7 @@ def redact_config_for_log(config: YggConfig) -> dict[str, Any]:
         "default_domain": config.default_domain,
         "search_include_open": config.search_include_open,
         "fusion": config.fusion.value,
+        "scrub_content": config.scrub_content,
         "w_task": config.w_task,
         "w_scaffold": config.w_scaffold,
         "effort_filter_mode": config.effort_filter_mode.value,

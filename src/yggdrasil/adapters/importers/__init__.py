@@ -7,6 +7,7 @@ from yggdrasil.adapters.importers.mongo_mapping import (
     map_mongo_conversation_doc,
     map_mongo_session_doc,
     map_session_hierarchy,
+    messages_to_steps,
 )
 from yggdrasil.adapters.importers.mongo_normalize import (
     ConversationIR,
@@ -30,6 +31,7 @@ __all__ = [
     "map_mongo_conversation_doc",
     "map_mongo_session_doc",
     "map_session_hierarchy",
+    "messages_to_steps",
     "normalize_and_aggregate_docs",
     "normalize_mongo_doc",
     "segment_conversation_ir",
