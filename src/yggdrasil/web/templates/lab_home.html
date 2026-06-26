@@ -10,9 +10,11 @@
     Writes still bind your owner server-side. Session stores <code>token_id</code> only.</p>
 
   <div class="actions">
-    <a class="btn" href="{{ p('/lab/skill.md') }}{% if bearer_token %}?token={{ bearer_token }}{% endif %}">Download skill.md</a>
-    <a class="btn" href="{{ p('/lab/mcp.json') }}{% if bearer_token %}?token={{ bearer_token }}{% endif %}">Download mcp.json</a>
+    <a class="btn" href="{{ p('/chat') }}">Chat with Codex + Yggdrasil</a>
+    <a class="btn" href="{{ p('/lab/skill.md') }}{% if bearer_token %}?token={{ bearer_token }}{% endif %}">Download skill.md (MCP + policies)</a>
+    <a class="btn-secondary" href="{{ p('/lab/mcp.json') }}{% if bearer_token %}?token={{ bearer_token }}{% endif %}">mcp.json only (optional)</a>
   </div>
+  <p class="note">Paste <strong>skill.md</strong> into your agent as one document — it embeds MCP client config and usage policies. Separate <code>mcp.json</code> is optional for hosts that only accept JSON.</p>
 
   {% if bearer_token %}
   <details class="token-reveal" open>

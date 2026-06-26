@@ -5,18 +5,22 @@ Run: uvicorn yggdrasil.web.app:app --host 127.0.0.1 --port 8080
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any, Union
+from urllib.parse import quote
 
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
 from yggdrasil.services.auth_service import AuthError
 from yggdrasil.web.auth_factory import WebAuthFacade, build_web_auth
+from yggdrasil.web.codex_runner import stream_codex_exec
+from yggdrasil.web.mcp_gateway import attach_mcp_gateway
 
 WEB_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = WEB_DIR / "templates"
@@ -25,6 +29,18 @@ STATIC_DIR = WEB_DIR / "static"
 DEFAULT_PUBLIC_BASE_URL = "http://127.0.0.1:8080"
 DEFAULT_UI_SECRET = "dev-secret"
 SESSION_COOKIE_KEY = "ygg_session"
+# Align cookie lifetime with typical lab token TTL (days → seconds); override via env.
+DEFAULT_SESSION_MAX_AGE = 90 * 24 * 3600
+
+# Paths that never require a valid API token session
+_PUBLIC_PATH_PREFIXES = (
+    "/healthz",
+    "/static",
+    "/lab/login",
+    "/demo",
+    "/api/v1/tokens/exchange",
+    "/mcp",
+)
 
 # Avoid FastAPI 0.116+ issues with PEP604 unions in some annotations by aliasing
 HtmlOrRedirect = Union[HTMLResponse, RedirectResponse]
@@ -63,6 +79,18 @@ def _session_secret(env: dict[str, str] | None = None) -> str:
     return (e.get("YGG_UI_SECRET") or DEFAULT_UI_SECRET).strip() or DEFAULT_UI_SECRET
 
 
+def _session_max_age(env: dict[str, str] | None = None) -> int:
+    e = env if env is not None else os.environ
+    raw = (e.get("YGG_UI_SESSION_MAX_AGE") or "").strip()
+    if raw.isdigit():
+        return max(60, int(raw))
+    # Prefer token TTL days from config if set via env
+    ttl_days = (e.get("YGG_TOKEN_TTL_DAYS") or "").strip()
+    if ttl_days.isdigit():
+        return max(60, int(ttl_days) * 24 * 3600)
+    return DEFAULT_SESSION_MAX_AGE
+
+
 def create_app(
     *,
     auth: WebAuthFacade | None = None,
@@ -76,6 +104,7 @@ def create_app(
     base_url = (public_base_url or _public_base_url(env_map)).rstrip("/")
     prefix = _url_prefix(env_map, public_base_url=base_url)
     secret = _session_secret(env_map)
+    session_max_age = _session_max_age(env_map)
 
     def _p(path: str) -> str:
         """App-absolute path with optional public prefix (e.g. /ygg/lab/home)."""
@@ -92,13 +121,48 @@ def create_app(
             env=env_map,
         )
 
-    app = FastAPI(title="Yggdrasil Control Plane", version="0.1.0")
+    # Avoid 307 /mcp → /mcp/ (breaks some MCP clients that POST initialize without slash)
+    app = FastAPI(title="Yggdrasil Control Plane", version="0.1.0", redirect_slashes=False)
+
+    from starlette.middleware.base import BaseHTTPMiddleware
+
+    class _McpTrailingSlashMiddleware(BaseHTTPMiddleware):
+        """Starlette Mount('/mcp') only matches /mcp/… — rewrite bare /mcp → /mcp/."""
+
+        async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
+            path = request.scope.get("path") or ""
+            if path == "/mcp":
+                request.scope["path"] = "/mcp/"
+                request.scope["raw_path"] = b"/mcp/"
+            return await call_next(request)
+
+    app.add_middleware(_McpTrailingSlashMiddleware)
+
+    # Path-prefix strip (runs inside session middleware — registered before Session so Session is outer).
+    if prefix:
+
+        class _StripPrefixMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
+                path = request.scope.get("path") or ""
+                if path == prefix or path.startswith(prefix + "/"):
+                    new_path = path[len(prefix) :] or "/"
+                    request.scope["path"] = new_path
+                    try:
+                        request.scope["raw_path"] = new_path.encode("utf-8")
+                    except Exception:
+                        pass
+                return await call_next(request)
+
+        app.add_middleware(_StripPrefixMiddleware)
+
+    # Session must be outermost among our stack (added last = runs first on request).
     app.add_middleware(
         SessionMiddleware,
         secret_key=secret,
         session_cookie=SESSION_COOKIE_KEY,
         same_site="lax",
-        https_only=False,
+        https_only=base_url.startswith("https://"),
+        max_age=session_max_age,
     )
 
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
@@ -109,6 +173,7 @@ def create_app(
     app.state.public_base_url = base_url
     app.state.url_prefix = prefix
     app.state.templates = templates
+    app.state.session_max_age = session_max_age
 
     def _tpl(request: Request, name: str, **ctx: Any) -> HTMLResponse:
         return templates.TemplateResponse(
@@ -120,22 +185,46 @@ def create_app(
                 "url_prefix": prefix,
                 "p": _p,
                 "mcp_url": f"{base_url}/mcp",
+                "session_max_age": session_max_age,
                 **ctx,
             },
         )
 
+    def _clear_session(request: Request) -> None:
+        for k in (
+            "token_id",
+            "owner",
+            "tenant_id",
+            "flash_token",
+            "token",
+            "bearer",
+            "session_exp",
+        ):
+            request.session.pop(k, None)
+
     def _session_user(request: Request) -> dict[str, Any] | None:
+        """Return session user only if cookie session + API token are still valid.
+
+        On expiry/revocation clears the session (auto sign-out).
+        """
         sess = request.session
         token_id = sess.get("token_id")
         owner = sess.get("owner")
         if not token_id or not owner:
             return None
+        principal = auth_svc.principal_for_token_id(str(token_id))
+        if principal is None:
+            _clear_session(request)
+            return None
+        # Keep session owner/tenant aligned with SoT
+        sess["owner"] = principal.owner
+        sess["tenant_id"] = principal.tenant_id
         return {
             "token_id": token_id,
-            "owner": owner,
-            "tenant_id": sess.get("tenant_id", "lab"),
-            # flash_token only present until consumed (one-time reveal)
+            "owner": principal.owner,
+            "tenant_id": principal.tenant_id,
             "flash_token": sess.get("flash_token"),
+            "bearer": sess.get("bearer") or sess.get("flash_token"),
         }
 
     def _set_session(
@@ -144,10 +233,13 @@ def create_app(
         *,
         flash_raw_token: bool = True,
     ) -> None:
-        """Persist token_id + owner; optionally flash raw bearer once for copy."""
+        """Persist token_id + owner; keep bearer in signed session for skill/chat until logout/expiry."""
         request.session["token_id"] = result["token_id"]
         request.session["owner"] = result["owner"]
         request.session["tenant_id"] = result["tenant_id"]
+        if result.get("token"):
+            # Needed for skill.md / Codex MCP for the life of the UI session
+            request.session["bearer"] = result["token"]
         if flash_raw_token and result.get("token"):
             request.session["flash_token"] = result["token"]
         else:
@@ -155,25 +247,43 @@ def create_app(
 
     def _pop_flash_token(request: Request) -> str | None:
         tok = request.session.pop("flash_token", None)
-        return tok if isinstance(tok, str) else None
-
-    def _clear_session(request: Request) -> None:
-        for k in ("token_id", "owner", "tenant_id", "flash_token", "token"):
-            request.session.pop(k, None)
+        # Prefer one-time reveal but leave `bearer` for downloads/chat
+        if isinstance(tok, str) and tok:
+            return tok
+        b = request.session.get("bearer")
+        return b if isinstance(b, str) else None
 
     def _bearer_from_request(request: Request) -> str | None:
-        """Bearer for skill/mcp: query, Authorization, or flash (not long-lived session secret)."""
+        """Bearer for skill/mcp: query, Authorization, or session bearer."""
         q = request.query_params.get("token")
         if q:
             return q
         auth_header = request.headers.get("authorization") or request.headers.get("Authorization")
         if auth_header and auth_header.lower().startswith("bearer "):
             return auth_header[7:].strip()
-        # Allow one-time flash still in session for same-session skill download after login
-        flash = request.session.get("flash_token")
-        if isinstance(flash, str) and flash:
-            return flash
+        for key in ("flash_token", "bearer"):
+            val = request.session.get(key)
+            if isinstance(val, str) and val:
+                return val
         return None
+
+    def _login_redirect(request: Request, *, reason: str = "session_expired") -> RedirectResponse:
+        _clear_session(request)
+        dest = _p("/lab/login")
+        if reason:
+            dest = f"{dest}?reason={quote(reason)}"
+        return RedirectResponse(url=dest, status_code=303)
+
+    def _path_is_public(path: str) -> bool:
+        if path == "/" or path == "":
+            return True
+        for pfx in _PUBLIC_PATH_PREFIXES:
+            if path == pfx or path.startswith(pfx + "/"):
+                return True
+        # demo skill is semi-public (auto-issues demo token)
+        if path.startswith("/demo"):
+            return True
+        return False
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -181,14 +291,19 @@ def create_app(
 
     @app.get("/", response_class=HTMLResponse)
     def home(request: Request) -> HTMLResponse:
-        return _tpl(request, "home.html")
+        user = _session_user(request)
+        return _tpl(request, "home.html", user=user)
 
     @app.get("/lab/login", response_class=HTMLResponse)
     def lab_login_get(request: Request) -> Any:
         user = _session_user(request)
         if user and user.get("tenant_id") == "lab":
             return RedirectResponse(url=_p("/lab/home"), status_code=303)
-        return _tpl(request, "lab_login.html", error=None)
+        reason = request.query_params.get("reason")
+        err = None
+        if reason == "session_expired":
+            err = "Your session expired or the API token was revoked. Sign in again."
+        return _tpl(request, "lab_login.html", error=err)
 
     @app.post("/lab/login", response_class=HTMLResponse)
     async def lab_login_post(request: Request, api_key: str = Form(...)) -> Any:
@@ -197,14 +312,17 @@ def create_app(
         except AuthError as exc:
             return _tpl(request, "lab_login.html", error=exc.message)
         _set_session(request, result, flash_raw_token=True)
-        return RedirectResponse(url=_p("/lab/home"), status_code=303)
+        nxt = request.query_params.get("next") or _p("/lab/home")
+        if not str(nxt).startswith(prefix or "/") and prefix:
+            nxt = _p("/lab/home")
+        return RedirectResponse(url=str(nxt), status_code=303)
 
     @app.get("/lab/home", response_class=HTMLResponse)
     def lab_home(request: Request) -> Any:
         user = _session_user(request)
         if not user or user.get("tenant_id") != "lab":
-            return RedirectResponse(url=_p("/lab/login"), status_code=303)
-        # Reveal bearer once (consume flash) — session keeps token_id only afterward
+            return _login_redirect(request, reason="session_expired")
+        # Reveal bearer on first home view (flash); session still keeps `bearer` for chat/skill
         bearer = _pop_flash_token(request)
         return _tpl(
             request,
@@ -215,10 +333,70 @@ def create_app(
             bearer_token=bearer,
         )
 
+    @app.get("/lab/logout")
     @app.post("/lab/logout")
     def lab_logout(request: Request) -> RedirectResponse:
         _clear_session(request)
-        return RedirectResponse(url=_p("/"), status_code=303)
+        # Expire cookie explicitly via empty session + redirect
+        resp = RedirectResponse(url=_p("/lab/login") + "?reason=signed_out", status_code=303)
+        return resp
+
+    @app.get("/chat", response_class=HTMLResponse)
+    def chat_page(request: Request) -> Any:
+        user = _session_user(request)
+        if not user or user.get("tenant_id") != "lab":
+            return _login_redirect(request, reason="session_expired")
+        return _tpl(
+            request,
+            "chat.html",
+            owner=user["owner"],
+            tenant_id=user["tenant_id"],
+        )
+
+    @app.get("/api/v1/chat/stream")
+    async def chat_stream(request: Request, q: str = "") -> Any:
+        """SSE stream: headless `codex exec --json` with Yggdrasil skill + MCP token."""
+        user = _session_user(request)
+        if not user or user.get("tenant_id") != "lab":
+            return JSONResponse({"detail": "session_expired"}, status_code=401)
+        prompt = (q or "").strip()
+        if not prompt:
+            return JSONResponse({"detail": "q (prompt) required"}, status_code=400)
+        bearer = _bearer_from_request(request)
+        if not bearer:
+            return JSONResponse(
+                {"detail": "no bearer in session — sign out and sign in again"},
+                status_code=401,
+            )
+
+        async def event_gen():
+            try:
+                async for item in stream_codex_exec(
+                    prompt,
+                    owner=user["owner"],
+                    tenant_id=user["tenant_id"],
+                    public_base_url=base_url,
+                    mcp_url=f"{base_url}/mcp",
+                    bearer_token=bearer,
+                ):
+                    if await request.is_disconnected():
+                        break
+                    ev = item.get("event") or "message"
+                    data = item.get("data") or ""
+                    yield f"event: {ev}\ndata: {data}\n\n"
+            except Exception as exc:
+                yield f"event: error\ndata: {json.dumps({'message': str(exc)})}\n\n"
+                yield f"event: done\ndata: {json.dumps({'ok': False})}\n\n"
+
+        return StreamingResponse(
+            event_gen(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     def _skill_context(request: Request, *, require_tenant: str | None = None) -> dict[str, Any] | None:
         token = _bearer_from_request(request)
@@ -354,12 +532,24 @@ def create_app(
         _clear_session(request)
         return JSONResponse({"status": "revoked"})
 
-    @app.get("/mcp")
-    def mcp_stub() -> JSONResponse:
-        return JSONResponse(
-            {"detail": "MCP HTTP gateway not implemented; use stdio with YGG_MCP_TOKEN"},
-            status_code=501,
+    # Streamable HTTP MCP for Codex/Cursor remote clients (Tailscale /ygg/mcp → /mcp)
+    try:
+        attach_mcp_gateway(
+            app,
+            auth_resolve=lambda tok: auth_svc.resolve_token(tok),
         )
+    except Exception as exc:  # pragma: no cover
+        import logging
+
+        logging.getLogger(__name__).exception("MCP HTTP gateway failed to attach: %s", exc)
+
+        @app.api_route("/mcp", methods=["GET", "POST", "DELETE"])
+        @app.api_route("/mcp/{path:path}", methods=["GET", "POST", "DELETE"])
+        async def mcp_unavailable(path: str = "") -> JSONResponse:
+            return JSONResponse(
+                {"detail": f"MCP HTTP gateway unavailable: {exc}"},
+                status_code=503,
+            )
 
     return app
 

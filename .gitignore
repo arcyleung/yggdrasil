@@ -44,3 +44,4 @@ user_mapping.yaml
 # audit outputs
 data_auditing/reports/
 
+.ygg_ui_skill/

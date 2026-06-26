@@ -1,29 +1,94 @@
 ---
 name: yggdrasil-trajectory-memory-demo
 description: >
-  Demo tenant experience memory (isolated from lab). Read-heavy trial; limited writes to demo only.
+  Demo tenant experience memory (isolated from lab). Self-contained skill: MCP
+  client config + trial usage in one paste. Read-heavy; limited demo-only writes.
 ---
 
 # Yggdrasil Demo Tenant
 
 You are using the **demo** tenant as owner **`{{ owner }}`**.
+This single document is enough to connect and try Yggdrasil — no separate `mcp.json` is required.
 
-## Isolation
+## 1. Wire MCP (do this first)
+
+### Cursor / VS Code style
+
+```json
+{
+  "mcpServers": {
+    "yggdrasil": {
+      "url": "{{ mcp_url }}",
+      "headers": {
+        "Authorization": "Bearer {{ bearer_token }}"
+      }
+    }
+  }
+}
+```
+
+### HTTP remote MCP (equivalent)
+
+```json
+{
+  "mcpServers": {
+    "yggdrasil": {
+      "type": "http",
+      "url": "{{ mcp_url }}",
+      "headers": {
+        "Authorization": "Bearer {{ bearer_token }}"
+      }
+    }
+  }
+}
+```
+
+### Stdio (token via env)
+
+```json
+{
+  "mcpServers": {
+    "yggdrasil": {
+      "command": "python",
+      "args": ["-m", "yggdrasil.mcp"],
+      "env": {
+        "YGG_MCP_TOKEN": "{{ bearer_token }}"
+      }
+    }
+  }
+}
+```
+
+| Field | Value |
+|-------|--------|
+| **Public base URL** | `{{ public_base_url }}` |
+| **MCP HTTP URL** | `{{ mcp_url }}` |
+| **Bearer token** | `{{ bearer_token }}` |
+| **Tenant** | `demo` (isolated; never lab data) |
+| **Owner** | `{{ owner }}` |
+
+If remote HTTP returns **501**, use stdio with `YGG_MCP_TOKEN` set to the bearer above.
+
+---
+
+## 2. Isolation
 
 - Retrieval is restricted to `tenant_id=demo` trajectories only.
 - **Never** returns lab org data.
 - Writes (if allowed) are demo-only and may be rate-limited.
+- Do **not** store sensitive lab data here.
 
-## Connection
-
-- **Public base URL:** `{{ public_base_url }}`
-- **MCP endpoint:** `{{ mcp_url }}`
-- **Authorization:** `Bearer {{ bearer_token }}`
-
-## Suggested usage
+## 3. Suggested usage
 
 1. Call `search_strategies` with a trial task to see seeded demo experiences.
 2. Optionally write a short demo trajectory; it stays in the demo tenant.
-3. Prefer read/explore over large write volume in demo.
+3. Prefer read/explore over large write volume.
+4. Surface any `owner` fields on hits for the human user.
 
-This is a **trial** environment — do not store sensitive lab data here.
+### Tools
+
+- `search_strategies` — primary read path
+- `start_trajectory` / `append_step` / `finalize_trajectory` — demo-only writes
+- `get_trajectory` — after shortlist
+
+This is a **trial** environment.

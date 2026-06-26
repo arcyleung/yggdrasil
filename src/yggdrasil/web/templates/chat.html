@@ -1,0 +1,140 @@
+{% extends "base.html" %}
+{% block title %}Chat — Yggdrasil{% endblock %}
+{% block content %}
+<section class="panel chat-panel">
+  <div class="chat-header">
+    <h1>Experience chat</h1>
+    <p class="note">Headless <strong>Codex</strong> with the Yggdrasil skill (search org trajectories via MCP when tools are available).
+      Live stream uses <code>Server-Sent Events</code>. Signed in as <code>{{ owner }}</code> / <code>{{ tenant_id }}</code>.</p>
+  </div>
+
+  <div id="chat-log" class="chat-log" aria-live="polite"></div>
+
+  <form id="chat-form" class="chat-form" action="javascript:void(0)">
+    <label class="sr-only" for="chat-input">Prompt</label>
+    <textarea id="chat-input" name="q" rows="3" placeholder="Ask about prior lab experience, e.g. Ray wheels setup failures…" required></textarea>
+    <div class="chat-actions">
+      <button type="submit" class="btn" id="chat-send">Send</button>
+      <button type="button" class="btn-secondary" id="chat-stop" disabled>Stop</button>
+      <span id="chat-status" class="note"></span>
+    </div>
+  </form>
+</section>
+
+<script>
+(function () {
+  const prefix = {{ (url_prefix or '')|tojson }};
+  const log = document.getElementById('chat-log');
+  const form = document.getElementById('chat-form');
+  const input = document.getElementById('chat-input');
+  const sendBtn = document.getElementById('chat-send');
+  const stopBtn = document.getElementById('chat-stop');
+  const statusEl = document.getElementById('chat-status');
+  let es = null;
+
+  function addBubble(role, text, cls) {
+    const div = document.createElement('div');
+    div.className = 'chat-bubble ' + (cls || role);
+    const meta = document.createElement('div');
+    meta.className = 'chat-meta';
+    meta.textContent = role;
+    const body = document.createElement('pre');
+    body.className = 'chat-text';
+    body.textContent = text;
+    div.appendChild(meta);
+    div.appendChild(body);
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+    return body;
+  }
+
+  function setBusy(busy) {
+    sendBtn.disabled = busy;
+    stopBtn.disabled = !busy;
+    statusEl.textContent = busy ? 'Streaming…' : '';
+  }
+
+  function onSessionExpired() {
+    setBusy(false);
+    addBubble('system', 'Session expired — redirecting to sign-in…', 'error');
+    window.location.href = prefix + '/lab/login?reason=session_expired';
+  }
+
+  form.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    const q = (input.value || '').trim();
+    if (!q) return;
+    if (es) { es.close(); es = null; }
+
+    addBubble('you', q, 'user');
+    input.value = '';
+    const agentBody = addBubble('codex', '', 'agent');
+    setBusy(true);
+
+    const url = prefix + '/api/v1/chat/stream?q=' + encodeURIComponent(q);
+    es = new EventSource(url);
+
+    function append(text) {
+      if (!text) return;
+      agentBody.textContent += (agentBody.textContent ? '\n' : '') + text;
+      log.scrollTop = log.scrollHeight;
+    }
+
+    es.addEventListener('message', function (e) {
+      try {
+        const j = JSON.parse(e.data);
+        append(j.text || e.data);
+      } catch (_) { append(e.data); }
+    });
+    es.addEventListener('reasoning', function (e) {
+      try {
+        const j = JSON.parse(e.data);
+        append('… ' + (j.text || ''));
+      } catch (_) { append(e.data); }
+    });
+    es.addEventListener('tool', function (e) {
+      try {
+        const j = JSON.parse(e.data);
+        append('[tool] ' + (j.text || ''));
+      } catch (_) { append(e.data); }
+    });
+    es.addEventListener('log', function (e) {
+      try {
+        const j = JSON.parse(e.data);
+        append(j.text || JSON.stringify(j));
+      } catch (_) { append(e.data); }
+    });
+    es.addEventListener('status', function (e) {
+      statusEl.textContent = 'Running…';
+    });
+    es.addEventListener('error', function (e) {
+      if (e.data) {
+        try {
+          const j = JSON.parse(e.data);
+          append('[error] ' + (j.message || e.data));
+        } catch (_) { append('[error] ' + e.data); }
+      }
+    });
+    es.addEventListener('done', function (e) {
+      setBusy(false);
+      if (es) { es.close(); es = null; }
+      try {
+        const j = JSON.parse(e.data || '{}');
+        statusEl.textContent = j.ok ? 'Done' : ('Exit ' + (j.exit_code != null ? j.exit_code : 'error'));
+      } catch (_) { statusEl.textContent = 'Done'; }
+    });
+    es.onerror = function () {
+      if (es && es.readyState === EventSource.CLOSED) {
+        setBusy(false);
+      }
+    };
+  });
+
+  stopBtn.addEventListener('click', function () {
+    if (es) { es.close(); es = null; }
+    setBusy(false);
+    statusEl.textContent = 'Stopped';
+  });
+})();
+</script>
+{% endblock %}

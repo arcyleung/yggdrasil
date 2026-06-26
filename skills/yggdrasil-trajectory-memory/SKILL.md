@@ -1,16 +1,86 @@
 ---
 name: yggdrasil-trajectory-memory
 description: >
-  Org-wide agent experience memory (not doc RAG). Before work that is uncertain
-  to succeed or has large research/setup overhead, search_strategies (search_experience)
-  to discover whether other agents already tried similar goals—learn from outcomes,
-  effort, and artifacts; always surface hit owner/agent_id so the user can follow up
-  in person. After non-trivial sessions worth preserving, write trajectories with
-  owner/agent/team/workspace and artifacts via start_trajectory, append_step,
-  finalize_trajectory, get_trajectory, update_trajectory_meta.
+  Org-wide agent experience memory (not doc RAG). Self-contained skill: includes MCP
+  client config patterns plus search/write policies. Before uncertain or high-overhead
+  work, search_strategies; surface hit owner/agent_id for human follow-up. Write
+  trajectories via start_trajectory, append_step, finalize_trajectory, get_trajectory,
+  update_trajectory_meta. Prefer the personalized lab skill.md from the control plane
+  (token embedded); this file uses placeholders for self-hosted setups.
 ---
 
 # Yggdrasil Trajectory Experience Memory
+
+**One-paste onboarding:** This skill is meant to be the **only** document you give an agent.
+Wire MCP (section below), then follow the policies. If you downloaded a personalized
+`skill.md` from the Yggdrasil lab/demo UI, prefer that file — it has your live bearer token
+and URLs already filled in (no separate `mcp.json`).
+
+## Wire MCP (self-hosted / placeholders)
+
+Replace `YGG_PUBLIC_BASE`, `YGG_MCP_URL`, and `YGG_BEARER_TOKEN` with values from your
+operator (or lab UI). Never put lab `sk-` API keys into agent MCP configs.
+
+### Cursor / VS Code (`mcpServers`)
+
+```json
+{
+  "mcpServers": {
+    "yggdrasil": {
+      "url": "YGG_MCP_URL",
+      "headers": {
+        "Authorization": "Bearer YGG_BEARER_TOKEN"
+      }
+    }
+  }
+}
+```
+
+Typical remote URL shape: `https://<host>/ygg/mcp` or `http://127.0.0.1:8080/mcp` depending on
+funnel / `public_base_url`.
+
+### HTTP remote MCP (equivalent)
+
+```json
+{
+  "mcpServers": {
+    "yggdrasil": {
+      "type": "http",
+      "url": "YGG_MCP_URL",
+      "headers": {
+        "Authorization": "Bearer YGG_BEARER_TOKEN"
+      }
+    }
+  }
+}
+```
+
+### Stdio MCP
+
+```bash
+export YGG_MCP_TOKEN='YGG_BEARER_TOKEN'
+# also configure SQLite/Qdrant/embed via .env on the server host
+python -m yggdrasil.mcp
+```
+
+```json
+{
+  "mcpServers": {
+    "yggdrasil": {
+      "command": "python",
+      "args": ["-m", "yggdrasil.mcp"],
+      "env": {
+        "YGG_MCP_TOKEN": "YGG_BEARER_TOKEN"
+      }
+    }
+  }
+}
+```
+
+If remote HTTP MCP returns **501**, use stdio with `YGG_MCP_TOKEN`. After tools appear, continue below.
+
+---
+
 
 You are using **Yggdrasil**, an MCP server that stores and retrieves **agent trajectories**
 (task + scaffold + steps + progress + outcome + concrete effort). It is **not** document
@@ -139,4 +209,4 @@ For long work, segment first into `{start_idx, end_idx, task, outcome}` list and
 4. Long session? → segment before writing.
 5. Done? → finalize with real `outcome` + concrete effort numbers.
 
-See README + `.env.example` for server setup. Do not commit secrets or `user_mapping.yaml`.
+Server setup: README + `.env.example`. Personalized tokens: lab UI **Download skill.md** (MCP config is embedded). Do not commit secrets or `user_mapping.yaml`.

@@ -2,75 +2,126 @@
 
 **MCP-native org-wide trajectory experience memory for autonomous agents.**
 
-Agents record coding sessions (steps, progress, outcomes, concrete effort + artifacts) and retrieve similar *strategies* via multi-aspect embeddings (`task` + `scaffold`) in Qdrant, with full traces + deliverables in SQLite.
+Agents record real work (steps, progress, outcomes, effort, artifacts) and retrieve similar *strategies* via multi-aspect embeddings (`task` + `scaffold`), with full traces in SQLite and vectors in Qdrant. Humans regain **context** over fleets of agents on long-horizon tasks—without maintaining a parallel documentation culture.
 
-Yggdrasil helps **humans regain context** over fleets of autonomous agents running long-horizon tasks. As agents operate independently, humans accumulate "context debt"—the growing loss of shared understanding about what was attempted, the actual paths taken, effort expended, outcomes, and concrete artifacts produced. By treating the *trajectory itself* as the durable record of strategy + execution + outcomes, Yggdrasil lets humans (directly or through agents) recover relevant history on demand.
+**Status:** PoC. Spec: [`docs/superpowers/specs/2026-06-24-yggdrasil-mcp-trajectory-memory-design.md`](docs/superpowers/specs/2026-06-24-yggdrasil-mcp-trajectory-memory-design.md). Deeper literature: [org-level agent experience memory survey](surveys/org_level_agent_experience_memory_literature_survey.md).
 
-In the new era of agentic coding:
-- The **trajectory is the solidified record**. It requires no ongoing maintenance—only relevance-based querying as time passes.
-- Humans are rarely inclined to read AI-generated documentation. In practice, *agents* read docs, notes, and artifacts on the human's behalf. Humans primarily consume the agents' synthesized responses and decisions.
-- Therefore, preserving the actual execution trace + artifacts (indexed intelligently) is far more valuable and lower-friction than maintaining separate human-facing docs that quickly go stale.
+---
 
-**Status:** PoC / greenfield. Spec: [`docs/superpowers/specs/2026-06-24-yggdrasil-mcp-trajectory-memory-design.md`](docs/superpowers/specs/2026-06-24-yggdrasil-mcp-trajectory-memory-design.md). Plan: [`docs/superpowers/plans/2026-06-24-yggdrasil-mcp-trajectory-memory.md`](docs/superpowers/plans/2026-06-24-yggdrasil-mcp-trajectory-memory.md).
+## Install for lab users (skill + remote MCP)
 
-## Differentiation from Other Agent Memory Frameworks
+You do **not** need to run Yggdrasil yourself. An operator hosts the control plane and data plane; you only need a **secret API key** they mapped to your name (e.g. in `user_mapping.yaml`).
 
-Yggdrasil is **not another fact store, vector RAG, or conversational memory layer**. Compare with common alternatives (Mem0, MemClaw / governed fleet memory, Zep + Graphiti, Letta, A-MEM, Byterover, official MCP memory servers, LangMem, etc.):
+1. Open the **Yggdrasil host** URL your org provides (control plane UI).
+2. **Lab login** with your **secret key** (`sk-…` style org key—not a password you invent).
+3. Download **`skill.md` (MCP + policies)** — one document that embeds:
+   - how to connect MCP (Streamable HTTP to the host’s `/mcp` with your issued `ygg_…` bearer), and
+   - search/write policies (search before uncertain work, surface owners, segment long runs, …).
+4. **Paste that skill** into your favorite agent (Codex, Claude Code, Cursor, Grok skills, …) as the Yggdrasil skill.
+5. Point the agent’s MCP client at the URL + bearer from the skill (or use `mcp.json` from the same login). Tools such as `search_strategies` / `start_trajectory` should appear once MCP handshakes succeed.
 
-- **Most alternatives** focus on long-term *facts*, knowledge graphs, entity observations, or document/conversation retrieval for personalization, coherence, or single-user/agent state. They optimize for "what does the user/agent know?" or "retrieve relevant snippets."
-- **Yggdrasil** is execution- and outcome-oriented: it stores *trajectories* of real work (current task + scaffold as the strategy abstraction for search, full steps with kind/summary/payload, concrete effort accounting including failure waste, terminal outcomes, and rich artifacts like .md files, reports, code, logs, and data). Retrieval surfaces prior *strategies that were actually executed* plus what they produced and cost.
+Re-download `skill.md` if your token is revoked or you sign in again (bearer is session-bound).
 
-Key differentiators:
-- **Org-level with human handoff** — Every hit always surfaces the human `owner` (and agent_id/team) so the *person* can be contacted for follow-up. This is first-class, not an afterthought. Most systems offer user/agent scoping but de-emphasize the human-to-human loop.
-- **MCP-native by design** — Built as a drop-in MCP server/tool set that any preferred agent (Claude Code, Cursor, custom, etc.) can use directly. Reduces N×M integration tax.
-- **Strategy + execution separation** — Only the *current* task + scaffold are embedded for search (avoids polluting indexes with retry history). Full traces and artifacts are fetched on demand after shortlisting. This keeps retrieval focused on reusable high-level approaches.
-- **"Search before you build" reflex + write policy** — Explicitly encourages agents to consult prior org experience on uncertain or high-overhead work, then selectively persist only valuable runs. Many memory systems are passive append-only or always-on.
-- **No maintenance burden like docs** — See philosophy above. The trajectory *is* the record.
+### Example prompt (after skill + MCP are live)
 
-See the companion [org-level agent experience memory literature survey](surveys/org_level_agent_experience_memory_literature_survey.md) (50+ papers, blogs, Reddit/HN threads, frameworks) for detailed gaps analysis, comparisons to MemClaw/Mem0/A-MEM/Zep/etc., and connections to Conway's Law, transactive memory systems, and boundary objects in human–agent organizations.
+Try something that forces **org experience search** and **human handoff**, not a greenfield invent:
 
-## Control plane UI
+> Who has set up the Kubernetes infra in the lab, configured it the most, and might be the most familiar? Search Yggdrasil for prior trajectories; name the **owners** I should talk to, summarize what worked or failed, and link any artifacts.
 
-FastAPI + Jinja control plane for lab/demo sign-in and personalized skill / MCP config download:
+A good agent will call `search_strategies` (often `search_mode=lab`), report **owner / agent_id / team**, optionally `get_trajectory` on the best hits, and only then suggest next steps or people to ping.
+
+---
+
+## Value proposition
+
+### 1) No documentation maintenance burden
+
+Trajectories are the **experiential source of truth**. Agents and scaffolds act as a **self-verifier / attestation** mechanism: what was tried is what was recorded (task + scaffold for retrieval, steps and outcomes for proof)—not a wiki someone was supposed to update after the fact. Humans rarely read AI-generated docs; agents do. Indexing execution traces beats maintaining stale human-facing writeups as **context debt** grows.
+
+### 2) Memoization via “tombstones”
+
+Success and failure outcomes of prior agents on **complex / long-horizon** tasks are durable **tombstones**: cheap to consult, expensive to rediscover. They memoize “we already paid this cost” and give a **preview of likely outcomes** for similar tasks and strategies (including high `failure_waste_seconds` as a warning, not a template).
+
+### 3) Strategy-level understanding (not just the 20% humans see live)
+
+At test time a human may understand only a **fraction** (~20%) of the context of what agents are doing on the task at hand. For **auditing** and **long-term strategy** understanding, you need the agent’s **whole trajectory**—paths, retries, tools, artifacts—not only the final answer in chat. Yggdrasil keeps that lineage searchable at strategy grain (embed current task + scaffold only; full trace on demand).
+
+### 4) Security and management leverage
+
+- **Security / compliance auditing:** quick semantic search over “what did agents actually run?” for suspicious or policy-sensitive activity by org members (attribution via `owner` / `agent_id`).
+- **Management / efficiency:** see which human–agent interaction patterns burn tokens, loop, or succeed with low waste; improve playbooks and who to staff by **who has done this before** (handoff is first-class).
+
+---
+
+## Differentiation (vs Mem0, MemClaw, doc RAG, …)
+
+Yggdrasil is **not** another fact store, chat memory, or document RAG layer (Mem0, MemClaw-style fleet memory, Zep/Graphiti, Letta, A-MEM, Byterover, generic MCP memory servers, LangMem, …). Those optimize for “what does the user/agent know?” or “retrieve snippets.” Yggdrasil optimizes for **“what strategies did we execute, what did they cost, what did they produce, and who owns the human follow-up?”**
+
+| Theme | Typical memory / RAG | Yggdrasil |
+|-------|----------------------|-----------|
+| Unit of memory | Facts, chunks, messages | **Trajectories** (strategy + steps + outcome + effort + artifacts) |
+| Search key | Text / passage embed | **Task + scaffold** aspects (not full retry transcripts) |
+| Org handoff | Often missing | **`owner` / `agent_id` / `team` on every useful hit** |
+| Integration | App-specific SDKs | **MCP-native** (remote HTTP on the host and/or stdio) |
+| Agent reflex | Passive or always-on write | **Search before uncertain / high-overhead work**, then selective write |
+
+---
+
+## For operators (host the control plane)
+
+FastAPI UI: lab login, personalized `skill.md` / `mcp.json`, Streamable HTTP MCP at `/mcp` (Bearer `ygg_…`), optional chat UI.
 
 ```bash
 pip install -e ".[web,dev]"
-export YGG_PUBLIC_BASE_URL=http://127.0.0.1:8080
-export KEY_NAME_MAP='{"sk-test":"alice"}'   # or YGG_USER_MAPPING_PATH=user_mapping.yaml
+export YGG_PUBLIC_BASE_URL=https://your-yggdrasil-host.example   # public URL agents will use
+export YGG_URL_PREFIX=                                          # set if UI is served under a path prefix
+export YGG_USER_MAPPING_PATH=user_mapping.yaml                  # api_key -> owner (do not commit)
+# Qdrant + embed endpoint via .env — see .env.example
 uvicorn yggdrasil.web.app:app --host 127.0.0.1 --port 8080
+# or: YGG_UI_BIND=127.0.0.1:6001 python -m yggdrasil.web
 ```
 
-Tailscale Funnel / DDNS: see [`docs/superpowers/runbooks/tailscale-funnel.md`](docs/superpowers/runbooks/tailscale-funnel.md).
+Map each lab user in `user_mapping.yaml` (`sk-…: alice`). Users log in with that key; the UI issues opaque `ygg_…` tokens for MCP. Reverse-proxy / private network / Funnel-style exposure is an ops choice—publish **one stable base URL** in `YGG_PUBLIC_BASE_URL` so skill downloads embed the right MCP endpoint.
+
+Optional ops notes (path prefixes, private mesh): [`docs/superpowers/runbooks/tailscale-funnel.md`](docs/superpowers/runbooks/tailscale-funnel.md).
 
 ## Architecture (Approach 2)
 
 | Layer | Role |
 |-------|------|
-| MCP tools (stdio) | Validate args, call services, format responses |
+| MCP tools (stdio **or** Streamable HTTP `/mcp`) | Validate args, call services, format responses; principal from Bearer / `YGG_MCP_TOKEN` |
+| Control plane UI | Login, skill download, optional chat |
 | Services | Session / search / embed orchestration |
 | Ports | `Embedder`, `TrajectoryStore`, `VectorIndex`, `EmbedView` |
 | Adapters | SQLite, Qdrant, OpenAI-compat embedder, Mongo import shim |
 | Domain | Trajectory / Step / Progress / Outcome / EffortLedger models |
 
-## Quick start
+## Quick start (developers / local data plane)
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[web,dev]"
 
 # Qdrant
 docker compose up -d
 curl -s http://localhost:6333/readyz
 
 cp .env.example .env
-# set EMBED_API_KEY (and other EMBED_* if needed)
+# set EMBED_* , YGG_USER_MAPPING_PATH / KEY_NAME_MAP, YGG_PUBLIC_BASE_URL
 
-# MCP server (after implementation tasks complete)
-python -m yggdrasil.mcp.server
-# or: yggdrasil-mcp
+# Control plane + remote MCP (preferred for agents off-box)
+uvicorn yggdrasil.web.app:app --host 127.0.0.1 --port 8080
+
+# Optional: stdio MCP only (same machine as SQLite/Qdrant)
+# export YGG_MCP_TOKEN=ygg_…   # issued token, or omit if tenancy off
+python -m yggdrasil.mcp
 
 pytest -q
 ```
+
+## Agent skill (production write path)
+
+End users should prefer the **personalized `skill.md` from the host UI** (token + MCP URL embedded). The repo copy [`skills/yggdrasil-trajectory-memory/SKILL.md`](skills/yggdrasil-trajectory-memory/SKILL.md) is the same policies with placeholders for self-hosted setups. Agents should **segment** multi-goal sessions, then MCP-write per segment—do not embed one giant multi-goal key.
 
 ## Mongo import (testing / hydration)
 
@@ -188,10 +239,6 @@ PYTHONPATH=src python scripts/estimate_experience_storage.py \
 ```
 
 Rough order of magnitude (children only, dim=1024, ~8 segments/session): **~2.6 MiB extra** for 10 sessions / 80 children; **~tens of MiB** for ~100 sessions depending on segment count. See script output for vector vs SQLite breakdown.
-
-### Agent skill (production write path)
-
-Symlink or copy [`skills/yggdrasil-trajectory-memory/SKILL.md`](skills/yggdrasil-trajectory-memory/SKILL.md) into the agent host skills dir. Agents should **segment first** (Workflow E in the skill), then MCP-write each child trajectory—do not embed entire multi-goal sessions as one key.
 
 ### Integration smoke (non-Mongo)
 

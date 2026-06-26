@@ -68,6 +68,21 @@ class WebAuthFacade:
     def revoke_token_id(self, token_id: str) -> bool:
         return self._auth.revoke_token(token_id)
 
+    def principal_for_token_id(self, token_id: str) -> Principal | None:
+        """Return Principal if token_id exists, not revoked, and not expired."""
+        from datetime import datetime, timezone
+
+        rec = self._tokens.get_record(str(token_id))
+        if rec is None or rec.revoked_at is not None:
+            return None
+        if rec.expires_at is not None:
+            exp = rec.expires_at
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if exp < datetime.now(timezone.utc):
+                return None
+        return rec.to_principal()
+
 
 def build_web_auth(
     *,
