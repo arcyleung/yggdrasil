@@ -4,14 +4,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}Yggdrasil{% endblock %}</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="{{ p('/static/style.css') }}">
 </head>
 <body>
   <header class="site-header">
-    <a class="brand" href="/">Yggdrasil</a>
+    <a class="brand" href="{{ p('/') }}">Yggdrasil</a>
     <nav>
-      <a href="/lab/login">Lab</a>
-      <a href="/demo">Demo</a>
+      <a href="{{ p('/lab/login') }}">Lab</a>
+      <a href="{{ p('/demo') }}">Demo</a>
     </nav>
   </header>
   <main class="container">

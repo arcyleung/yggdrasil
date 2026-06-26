@@ -2,25 +2,18 @@
 {% block title %}Demo — Yggdrasil{% endblock %}
 {% block content %}
 <section class="panel">
-  <h1>Try the demo tenant</h1>
-  <p>The demo org is <strong>fully isolated</strong> from lab data. Retrieval only returns
-    trajectories with <code>tenant_id=demo</code> (seeded demo experiences). Writes, if enabled,
-    are limited to the demo tenant and may be rate-limited.</p>
-  {% if error %}
-  <p class="error" role="alert">{{ error }}</p>
-  {% endif %}
+  <h1>Demo tenant</h1>
+  <p>Isolated trial org (<code>demo</code>). Does not see lab trajectories.</p>
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
   {% if demo_token %}
-  <p>Signed in as <strong>{{ demo_owner }}</strong> (tenant <code>demo</code>).</p>
+  <p>Owner: <code>{{ demo_owner }}</code></p>
+  <pre class="token">{{ demo_token }}</pre>
   <div class="actions">
-    <a class="btn" href="/demo/skill.md">Download demo skill.md</a>
+    <a class="btn" href="{{ p('/demo/skill.md') }}?token={{ demo_token }}">Download demo skill.md</a>
   </div>
-  <details class="token-reveal" open>
-    <summary>Demo bearer token</summary>
-    <pre class="token">{{ demo_token }}</pre>
-  </details>
   {% else %}
-  <form method="post" action="/demo" class="form">
-    <button type="submit">Get demo token</button>
+  <form method="post" action="{{ p('/demo') }}" class="form">
+    <button type="submit" class="btn">Issue demo token</button>
   </form>
   {% endif %}
 </section>

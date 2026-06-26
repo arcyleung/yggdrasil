@@ -1,6 +1,8 @@
 """SQLite TrajectoryStore unit/integration tests (tmp_path)."""
 from __future__ import annotations
 
+import sqlite3
+
 from yggdrasil.adapters.sqlite_store import SqliteTrajectoryStore
 from yggdrasil.domain.enums import IndexStatus, StepKind, TrajectoryStatus
 from yggdrasil.domain.models import Outcome
@@ -103,6 +105,69 @@ def test_wal_mode_enabled(tmp_path):
     store = SqliteTrajectoryStore(tmp_path / "wal.db")
     mode = store._conn.execute("PRAGMA journal_mode").fetchone()[0]
     assert mode.lower() == "wal"
+    store.close()
+
+
+def test_opens_and_migrates_legacy_db_without_tenant_column(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE trajectories (
+            id TEXT PRIMARY KEY,
+            domain TEXT NOT NULL,
+            status TEXT NOT NULL,
+            task_text TEXT NOT NULL,
+            scaffold_text TEXT NOT NULL,
+            runtime_fingerprint_json TEXT,
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            external_refs_json TEXT NOT NULL DEFAULT '{}',
+            artifacts_json TEXT NOT NULL DEFAULT '[]',
+            progress_json TEXT NOT NULL DEFAULT '{}',
+            outcome_json TEXT,
+            effort_json TEXT NOT NULL DEFAULT '{}',
+            embed_view_version TEXT NOT NULL DEFAULT 'coding_v1',
+            index_state TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            finalized_at TEXT
+        );
+        CREATE TABLE steps (
+            trajectory_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            scaffold_update TEXT,
+            is_checkpoint INTEGER NOT NULL DEFAULT 0,
+            recorded_at TEXT NOT NULL,
+            step_effort_json TEXT,
+            PRIMARY KEY (trajectory_id, seq)
+        );
+        INSERT INTO trajectories (
+            id, domain, status, task_text, scaffold_text, tags_json,
+            external_refs_json, progress_json, effort_json, embed_view_version,
+            index_state, created_at, updated_at
+        ) VALUES (
+            'legacy-1', 'coding', 'success', 'legacy task', 'legacy scaffold',
+            '[]', '{}', '{}', '{}', 'coding_v1', 'indexed',
+            '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = SqliteTrajectoryStore(db_path)
+    traj = store.get("legacy-1")
+    cols = {r[1] for r in store.connection.execute("PRAGMA table_info(trajectories)")}
+    indexes = {r[1] for r in store.connection.execute("PRAGMA index_list(trajectories)")}
+
+    assert "tenant_id" in cols
+    assert "index_status" in cols
+    assert traj.tenant_id == "lab"
+    assert traj.index_status == IndexStatus.READY
+    assert "idx_trajectories_tenant_status" in indexes
     store.close()
 
 

@@ -37,6 +37,27 @@ def _public_base_url(env: dict[str, str] | None = None) -> str:
     return (e.get("YGG_PUBLIC_BASE_URL") or DEFAULT_PUBLIC_BASE_URL).rstrip("/")
 
 
+def _url_prefix(env: dict[str, str] | None = None, *, public_base_url: str | None = None) -> str:
+    """Path prefix when behind Tailscale Funnel --set-path=/ygg (proxy strips prefix).
+
+    Links/redirects must use this prefix so browsers stay on /ygg/* not host root.
+    """
+    e = env if env is not None else os.environ
+    explicit = (e.get("YGG_URL_PREFIX") or "").strip().rstrip("/")
+    if explicit:
+        return explicit if explicit.startswith("/") else f"/{explicit}"
+    base = public_base_url or _public_base_url(e)
+    try:
+        from urllib.parse import urlparse
+
+        path = (urlparse(base).path or "").rstrip("/")
+        if path and path != "/":
+            return path
+    except Exception:
+        pass
+    return ""
+
+
 def _session_secret(env: dict[str, str] | None = None) -> str:
     e = env if env is not None else os.environ
     return (e.get("YGG_UI_SECRET") or DEFAULT_UI_SECRET).strip() or DEFAULT_UI_SECRET
@@ -53,7 +74,14 @@ def create_app(
     """Application factory (testable). Uses real AuthService + SQLite token store."""
     env_map = dict(env) if env is not None else dict(os.environ)
     base_url = (public_base_url or _public_base_url(env_map)).rstrip("/")
+    prefix = _url_prefix(env_map, public_base_url=base_url)
     secret = _session_secret(env_map)
+
+    def _p(path: str) -> str:
+        """App-absolute path with optional public prefix (e.g. /ygg/lab/home)."""
+        if not path.startswith("/"):
+            path = "/" + path
+        return f"{prefix}{path}" if prefix else path
 
     if auth is not None:
         auth_svc = auth
@@ -79,6 +107,7 @@ def create_app(
 
     app.state.auth = auth_svc
     app.state.public_base_url = base_url
+    app.state.url_prefix = prefix
     app.state.templates = templates
 
     def _tpl(request: Request, name: str, **ctx: Any) -> HTMLResponse:
@@ -88,6 +117,8 @@ def create_app(
             {
                 "request": request,
                 "public_base_url": base_url,
+                "url_prefix": prefix,
+                "p": _p,
                 "mcp_url": f"{base_url}/mcp",
                 **ctx,
             },
@@ -156,7 +187,7 @@ def create_app(
     def lab_login_get(request: Request) -> Any:
         user = _session_user(request)
         if user and user.get("tenant_id") == "lab":
-            return RedirectResponse(url="/lab/home", status_code=303)
+            return RedirectResponse(url=_p("/lab/home"), status_code=303)
         return _tpl(request, "lab_login.html", error=None)
 
     @app.post("/lab/login", response_class=HTMLResponse)
@@ -166,13 +197,13 @@ def create_app(
         except AuthError as exc:
             return _tpl(request, "lab_login.html", error=exc.message)
         _set_session(request, result, flash_raw_token=True)
-        return RedirectResponse(url="/lab/home", status_code=303)
+        return RedirectResponse(url=_p("/lab/home"), status_code=303)
 
     @app.get("/lab/home", response_class=HTMLResponse)
     def lab_home(request: Request) -> Any:
         user = _session_user(request)
         if not user or user.get("tenant_id") != "lab":
-            return RedirectResponse(url="/lab/login", status_code=303)
+            return RedirectResponse(url=_p("/lab/login"), status_code=303)
         # Reveal bearer once (consume flash) — session keeps token_id only afterward
         bearer = _pop_flash_token(request)
         return _tpl(
@@ -187,7 +218,7 @@ def create_app(
     @app.post("/lab/logout")
     def lab_logout(request: Request) -> RedirectResponse:
         _clear_session(request)
-        return RedirectResponse(url="/", status_code=303)
+        return RedirectResponse(url=_p("/"), status_code=303)
 
     def _skill_context(request: Request, *, require_tenant: str | None = None) -> dict[str, Any] | None:
         token = _bearer_from_request(request)
@@ -213,7 +244,7 @@ def create_app(
         if ctx is None:
             user = _session_user(request)
             if not user:
-                return RedirectResponse(url="/lab/login", status_code=303)
+                return RedirectResponse(url=_p("/lab/login"), status_code=303)
             return PlainTextResponse(
                 "unauthorized: pass ?token=ygg_... or Authorization Bearer (session stores token_id only)",
                 status_code=401,
@@ -227,7 +258,7 @@ def create_app(
         if ctx is None:
             user = _session_user(request)
             if not user:
-                return RedirectResponse(url="/lab/login", status_code=303)
+                return RedirectResponse(url=_p("/lab/login"), status_code=303)
             return PlainTextResponse(
                 "unauthorized: pass ?token=ygg_... or Authorization Bearer",
                 status_code=401,
@@ -281,7 +312,7 @@ def create_app(
                     "tenant_id": result["tenant_id"],
                 }
             except AuthError:
-                return RedirectResponse(url="/demo", status_code=303)
+                return RedirectResponse(url=_p("/demo"), status_code=303)
         text = templates.get_template("skill_demo.md.j2").render(**ctx)
         return PlainTextResponse(text, media_type="text/markdown; charset=utf-8")
 

@@ -42,6 +42,20 @@ def _is_null_condition(key: str) -> qm.IsNullCondition:
     return qm.IsNullCondition(is_null=qm.PayloadField(key=key))
 
 
+def _is_empty_condition(key: str) -> qm.IsEmptyCondition:
+    return qm.IsEmptyCondition(is_empty=qm.PayloadField(key=key))
+
+
+def _tenant_condition(tenant_id: str) -> qm.Condition | qm.Filter:
+    match_tenant = _field_condition("tenant_id", qm.MatchValue(value=tenant_id))
+    if tenant_id == "lab":
+        # Legacy experience-grade Qdrant points predate tenant payloads. SQLite is
+        # still hydrated and tenant-checked after vector recall, so include those
+        # old points for lab searches without opening non-lab tenants.
+        return qm.Filter(should=[match_tenant, _is_empty_condition("tenant_id")])
+    return match_tenant
+
+
 def compile_effort_predicate(
     predicate: EffortPredicate,
     *,
@@ -126,7 +140,7 @@ def compile_search_filter(
     if query.experience_grade_only is True:
         must.append(_field_condition("experience_grade", qm.MatchValue(value=True)))
     if query.tenant_id is not None:
-        must.append(_field_condition("tenant_id", qm.MatchValue(value=query.tenant_id)))
+        must.append(_tenant_condition(query.tenant_id))
 
     for key, value in (query.runtime_filters or {}).items():
         if key not in RUNTIME_FILTER_FIELDS:

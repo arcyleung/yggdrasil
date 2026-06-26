@@ -58,6 +58,11 @@ from yggdrasil.adapters.importers.mongo_conversation_importer import (  # noqa: 
     MongoConversationImporter,
 )
 from yggdrasil.adapters.importers.mongo_mapping import map_session_hierarchy  # noqa: E402
+from yggdrasil.adapters.importers.mongo_lanes import map_session_multilane  # noqa: E402
+from yggdrasil.adapters.importers.mongo_normalize import (  # noqa: E402
+    SessionAggregate,
+    aggregate_session_irs,
+)
 from yggdrasil.adapters.importers.mongo_segment import segment_conversation_ir  # noqa: E402
 from yggdrasil.adapters.importers.segment_schema import TrajectorySegment  # noqa: E402
 from yggdrasil.adapters.importers.storage_estimate import (  # noqa: E402
@@ -106,6 +111,74 @@ def segment_record_externally(
     return out
 
 
+def _session_aggregate_for_record(
+    record: dict[str, Any],
+    ir,
+    *,
+    live_mongo: bool = False,
+    mongo_uri: str | None = None,
+):
+    """Build SessionAggregate with all proxy requests when possible (B′ lanes need this)."""
+    from yggdrasil.adapters.importers.mongo_normalize import (
+        ConversationIR,
+        SessionAggregate,
+        normalize_and_aggregate_docs,
+    )
+
+    sid = record.get("session_id") or ir.session_id
+    if record.get("proxy_docs"):
+        aggs = normalize_and_aggregate_docs(record["proxy_docs"])
+        if aggs:
+            return aggs[0]
+    if live_mongo and sid and mongo_uri:
+        try:
+            from pymongo import MongoClient
+
+            cl = MongoClient(mongo_uri, serverSelectionTimeoutMS=20000)
+            docs = list(
+                cl["claude_conversations"]["conversations"].find(
+                    {"session_id": sid}, {"request_headers": 0}
+                )
+            )
+            cl.close()
+            for d in docs:
+                if "_id" in d and not isinstance(d["_id"], (str, dict)):
+                    d["_id"] = {"$oid": str(d["_id"])}
+            if docs:
+                aggs = normalize_and_aggregate_docs(docs)
+                if aggs:
+                    return aggs[0]
+        except Exception as exc:
+            print(f"live_mongo_warn session={sid}: {exc}", file=sys.stderr)
+
+    req_ids = record.get("request_ids") or ir.raw_external.get("request_ids") or [ir.request_id]
+    ir2 = ConversationIR(
+        session_id=ir.session_id,
+        request_id=ir.request_id,
+        model=ir.model,
+        created_at=ir.created_at,
+        updated_at=ir.updated_at,
+        title=ir.title,
+        project=ir.project,
+        tags=list(ir.tags),
+        system_text=ir.system_text,
+        tool_names=list(ir.tool_names),
+        messages=list(ir.messages),
+        usage=ir.usage,
+        source_shape=ir.source_shape,
+        raw_external={
+            **ir.raw_external,
+            "request_ids": req_ids,
+            "request_count": record.get("request_count") or len(req_ids),
+        },
+    )
+    return SessionAggregate(
+        session_id=ir2.session_id or sid or "unknown",
+        requests=[ir2],
+        canonical=ir2,
+    )
+
+
 def hydrate_record(
     record: dict[str, Any],
     importer: MongoConversationImporter,
@@ -117,30 +190,39 @@ def hydrate_record(
     experience_grade: bool = False,
     owner_map: dict[str, str] | None = None,
     session_identity: dict[str, Any] | None = None,
+    live_mongo: bool = False,
+    mongo_uri: str | None = None,
+    multilane: bool = True,
 ) -> dict[str, Any]:
     """Segment externally → map hierarchy → SQLite (+ optional Qdrant embed children).
 
-    experience_grade: cleaned task keys + tags that pass default agent retrieval gates
-    (for gated eval / pseudo-experience corpus). Still external segmentation, but not
-    tagged as hydration_test/archive so skill gates can return hits.
+    With multilane=True (default), uses policy B′ (system_hash|full_model maximizers)
+    plus within-lane segment slices. Pass live_mongo=True to re-fetch all proxy docs
+    for the session so multiple lanes are populated (JSONL often has only the old canonical IR).
     """
     seg_record = segment_record_externally(record, max_segment_msgs=max_segment_msgs)
     ir = record_to_ir(seg_record)
-    segmented = segment_conversation_ir(
-        ir,
-        max_segment_msgs=max_segment_msgs,
-        caller_segments=seg_record.get("segments"),
-    )
-    # Tag external hydration explicitly on trajectories via extra tags in mapping path:
-    # inject via segmented extra + re-map with embed_parent flag
-    hierarchy = map_session_hierarchy(ir, segmented=segmented, embed_parent=embed_parent)
+    if multilane:
+        agg = _session_aggregate_for_record(
+            record, ir, live_mongo=live_mongo, mongo_uri=mongo_uri
+        )
+        hierarchy = map_session_multilane(
+            agg, embed_parent=embed_parent, max_segment_msgs=max_segment_msgs
+        )
+    else:
+        segmented = segment_conversation_ir(
+            ir,
+            max_segment_msgs=max_segment_msgs,
+            caller_segments=seg_record.get("segments"),
+        )
+        hierarchy = map_session_hierarchy(ir, segmented=segmented, embed_parent=embed_parent)
 
     # Stamp external provenance on all trajectories' tags/refs
     def stamp(mapped):
         traj = mapped.trajectory
         tags = list(traj.tags)
         if experience_grade:
-            for t in ("experience_import", "cleaned_task_keys", "external_segmented"):
+            for t in ("experience_import", "cleaned_task_keys", "external_segmented", "multilane_bprime"):
                 if t not in tags:
                     tags.append(t)
             # remove archive tags if mapper added them
@@ -150,15 +232,17 @@ def hydrate_record(
                 if t not in ("external_pre_embed", "hydration_test", "not_author_segmented")
             ]
         else:
-            for t in ("external_pre_embed", "hydration_test", "not_author_segmented"):
+            for t in ("external_pre_embed", "hydration_test", "not_author_segmented", "multilane_bprime"):
                 if t not in tags:
                     tags.append(t)
         refs = {
             **traj.external_refs,
             "hydration_mode": "experience_grade" if experience_grade else "external_pre_embed",
-            "segmentation_source": seg_record.get("segmentation_source"),
+            "segmentation_source": seg_record.get("segmentation_source")
+            or traj.external_refs.get("segmentation_source"),
             "author_agent_segmented": False,
             "experience_grade": experience_grade,
+            "multilane_policy": "B_prime_system_hash_pipe_full_model" if multilane else "single_canonical",
         }
         # Owner / agent identity from truncated API key fingerprint (org PoC)
         ident = session_identity or seg_record.get("owner_identity") or {}
@@ -192,16 +276,56 @@ def hydrate_record(
             embed_children=True,
         )
 
+    lane_children = [
+        c
+        for c in hierarchy.children
+        if c.trajectory.external_refs.get("kind") == "session_lane"
+    ]
+    slice_children = [
+        c
+        for c in hierarchy.children
+        if c.trajectory.external_refs.get("kind") == "session_lane_slice"
+    ]
     return {
         "session_id": seg_record.get("session_id"),
         "segment_count": seg_record.get("segment_count"),
         "segmentation_source": seg_record.get("segmentation_source"),
         "parent_id": hierarchy.parent.trajectory.id,
         "child_ids": [c.trajectory.id for c in hierarchy.children],
+        "lane_count": len(lane_children)
+        if multilane
+        else hierarchy.parent.trajectory.external_refs.get("lane_count", 0),
+        "slice_count": len(slice_children)
+        if multilane
+        else len(hierarchy.children),
+        "lane_keys": hierarchy.parent.trajectory.external_refs.get("lane_keys") or [],
+        "multilane": multilane,
+        "multilane_policy": "B_prime_system_hash_pipe_full_model"
+        if multilane
+        else "single_canonical",
+        "request_count_in_agg": hierarchy.parent.trajectory.external_refs.get("request_count"),
         "embedded": embed and not dry_run,
         "dry_run": dry_run,
         "experience_grade": experience_grade,
     }
+
+
+def _resolve_mongo_uri(explicit: str | None, config) -> str | None:
+    """Prefer CLI --mongo-uri, then config.mongo_uri, then first line of creds file."""
+    if explicit:
+        return explicit.strip()
+    if getattr(config, "mongo_uri", None):
+        return config.mongo_uri
+    creds = getattr(config, "mongo_creds_file", None)
+    if creds is not None:
+        path = Path(creds)
+        if not path.is_absolute():
+            path = ROOT / path
+        if path.is_file():
+            line = path.read_text(encoding="utf-8").strip().splitlines()
+            if line and line[0].strip() and not line[0].strip().startswith("#"):
+                return line[0].strip()
+    return None
 
 
 def main() -> int:
@@ -246,6 +370,26 @@ def main() -> int:
         help="Clean task keys + tags that pass agent retrieval gates (not hydration_test archive)",
     )
     p.add_argument("--max-mem-gb", type=float, default=None, help="Process mem cap GiB (default 24)")
+    p.add_argument(
+        "--live-mongo",
+        action="store_true",
+        help="Re-fetch all proxy docs for each session_id (needed for multi-lane B′ when JSONL lacks proxy_docs)",
+    )
+    p.add_argument(
+        "--mongo-uri",
+        default=None,
+        help="Mongo URI override (else MONGO_URI / mongo_creds.txt first line)",
+    )
+    p.add_argument(
+        "--no-multilane",
+        action="store_true",
+        help="Use legacy single-canonical map_session_hierarchy (disable B′ multi-lane)",
+    )
+    p.add_argument(
+        "--session-id",
+        default=None,
+        help="Only process this session_id (scan JSONL; useful with --live-mongo smoke)",
+    )
     args = p.parse_args()
     if args.max_mem_gb is not None:
         apply_memory_cap(args.max_mem_gb)
@@ -255,19 +399,34 @@ def main() -> int:
         print("run: PYTHONPATH=src python scripts/export_mongo_sessions_jsonl.py --sessions 100", file=sys.stderr)
         return 2
 
+    multilane = not args.no_multilane
+
     # Stream JSONL — never load entire multi-GB export into RAM
     total_in_file = count_jsonl_lines(args.jsonl)
     records_iter = iter_sessions_jsonl(args.jsonl)
     # apply offset/limit without materializing full list
     records: list[dict[str, Any]] = []
     for i, rec in enumerate(records_iter):
-        if i < args.offset:
+        if args.session_id and rec.get("session_id") != args.session_id:
+            continue
+        if not args.session_id and i < args.offset:
             continue
         if args.limit is not None and len(records) >= args.limit:
             break
         records.append(rec)
+        if args.session_id:
+            break
 
     worker = args.worker_id or "main"
+    config = load_config()
+    mongo_uri = _resolve_mongo_uri(args.mongo_uri, config)
+    if args.live_mongo and not mongo_uri:
+        print(
+            "error: --live-mongo requires --mongo-uri, MONGO_URI, or mongo_creds.txt",
+            file=sys.stderr,
+        )
+        return 2
+
     print(
         json.dumps(
             {
@@ -278,6 +437,13 @@ def main() -> int:
                 "processing": len(records),
                 "mode": "segment_only" if args.segment_only else ("embed" if args.embed else "persist_no_embed"),
                 "hydration_mode": "external_pre_embed",
+                "multilane": multilane,
+                "multilane_policy": "B_prime_system_hash_pipe_full_model"
+                if multilane
+                else "single_canonical",
+                "live_mongo": args.live_mongo,
+                "mongo_uri_resolved": bool(mongo_uri),
+                "session_id_filter": args.session_id,
                 "note": "Segmentation is external (not trajectory author / skill path)",
             },
             indent=2,
@@ -288,7 +454,7 @@ def main() -> int:
         est = estimate_segmented_storage(
             n_sessions=len(records),
             segments_per_session=6.0,
-            embed_dim=load_config().embed_dim,
+            embed_dim=config.embed_dim,
             embed_parent=args.embed_parent,
         )
         print(format_estimate_report(est))
@@ -314,7 +480,6 @@ def main() -> int:
         )
         return 0
 
-    config = load_config()
     print("config:", json.dumps(redact_config_for_log(config), indent=2))
 
     ctx = AppContext.from_config(config)
@@ -336,6 +501,9 @@ def main() -> int:
                 dry_run=args.dry_run,
                 max_segment_msgs=args.max_segment_msgs,
                 experience_grade=args.experience_grade,
+                live_mongo=args.live_mongo,
+                mongo_uri=mongo_uri,
+                multilane=multilane,
             )
             results.append(summary)
         except Exception as exc:

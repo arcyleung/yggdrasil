@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 
 CREATE INDEX IF NOT EXISTS idx_steps_trajectory ON steps(trajectory_id);
 CREATE INDEX IF NOT EXISTS idx_trajectories_status ON trajectories(status);
-CREATE INDEX IF NOT EXISTS idx_trajectories_tenant_status ON trajectories(tenant_id, status);
+-- idx_trajectories_tenant_status created in _migrate_schema after tenant_id exists on legacy DBs
 CREATE INDEX IF NOT EXISTS idx_external_ref_traj ON external_ref_index(trajectory_id);
 CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash);
 """
@@ -136,6 +136,7 @@ class SqliteTrajectoryStore:
         # PoC multi-thread / multi-process safety knobs
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
+        # Create tables first; indexes that need migrated columns run in _migrate_schema
         self._conn.executescript(SCHEMA_SQL)
         self._migrate_schema()
         self._conn.commit()

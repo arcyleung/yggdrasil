@@ -8,11 +8,11 @@
     Lab users share one org memory; demo is an isolated trial tenant.
   </p>
   <div class="card-grid">
-    <a class="card" href="/lab/login">
+    <a class="card" href="{{ p('/lab/login') }}">
       <h2>Lab</h2>
       <p>Internal users. Prove your API key once, then download skill + MCP config for the shared <code>lab</code> org.</p>
     </a>
-    <a class="card" href="/demo">
+    <a class="card" href="{{ p('/demo') }}">
       <h2>Demo</h2>
       <p>External trial. Isolated <code>demo</code> tenant with seeded trajectories only — never sees lab data.</p>
     </a>
