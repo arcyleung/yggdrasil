@@ -1,8 +1,33 @@
 # Yggdrasil
 
-MCP trajectory experience memory: agents record coding sessions (steps, progress, outcomes, concrete effort) and retrieve similar strategies via multi-aspect embeddings (`task` + `scaffold`) in Qdrant, with full traces in SQLite.
+**MCP-native org-wide trajectory experience memory for autonomous agents.**
+
+Agents record coding sessions (steps, progress, outcomes, concrete effort + artifacts) and retrieve similar *strategies* via multi-aspect embeddings (`task` + `scaffold`) in Qdrant, with full traces + deliverables in SQLite.
+
+Yggdrasil helps **humans regain context** over fleets of autonomous agents running long-horizon tasks. As agents operate independently, humans accumulate "context debt"—the growing loss of shared understanding about what was attempted, the actual paths taken, effort expended, outcomes, and concrete artifacts produced. By treating the *trajectory itself* as the durable record of strategy + execution + outcomes, Yggdrasil lets humans (directly or through agents) recover relevant history on demand.
+
+In the new era of agentic coding:
+- The **trajectory is the solidified record**. It requires no ongoing maintenance—only relevance-based querying as time passes.
+- Humans are rarely inclined to read AI-generated documentation. In practice, *agents* read docs, notes, and artifacts on the human's behalf. Humans primarily consume the agents' synthesized responses and decisions.
+- Therefore, preserving the actual execution trace + artifacts (indexed intelligently) is far more valuable and lower-friction than maintaining separate human-facing docs that quickly go stale.
 
 **Status:** PoC / greenfield. Spec: [`docs/superpowers/specs/2026-06-24-yggdrasil-mcp-trajectory-memory-design.md`](docs/superpowers/specs/2026-06-24-yggdrasil-mcp-trajectory-memory-design.md). Plan: [`docs/superpowers/plans/2026-06-24-yggdrasil-mcp-trajectory-memory.md`](docs/superpowers/plans/2026-06-24-yggdrasil-mcp-trajectory-memory.md).
+
+## Differentiation from Other Agent Memory Frameworks
+
+Yggdrasil is **not another fact store, vector RAG, or conversational memory layer**. Compare with common alternatives (Mem0, MemClaw / governed fleet memory, Zep + Graphiti, Letta, A-MEM, Byterover, official MCP memory servers, LangMem, etc.):
+
+- **Most alternatives** focus on long-term *facts*, knowledge graphs, entity observations, or document/conversation retrieval for personalization, coherence, or single-user/agent state. They optimize for "what does the user/agent know?" or "retrieve relevant snippets."
+- **Yggdrasil** is execution- and outcome-oriented: it stores *trajectories* of real work (current task + scaffold as the strategy abstraction for search, full steps with kind/summary/payload, concrete effort accounting including failure waste, terminal outcomes, and rich artifacts like .md files, reports, code, logs, and data). Retrieval surfaces prior *strategies that were actually executed* plus what they produced and cost.
+
+Key differentiators:
+- **Org-level with human handoff** — Every hit always surfaces the human `owner` (and agent_id/team) so the *person* can be contacted for follow-up. This is first-class, not an afterthought. Most systems offer user/agent scoping but de-emphasize the human-to-human loop.
+- **MCP-native by design** — Built as a drop-in MCP server/tool set that any preferred agent (Claude Code, Cursor, custom, etc.) can use directly. Reduces N×M integration tax.
+- **Strategy + execution separation** — Only the *current* task + scaffold are embedded for search (avoids polluting indexes with retry history). Full traces and artifacts are fetched on demand after shortlisting. This keeps retrieval focused on reusable high-level approaches.
+- **"Search before you build" reflex + write policy** — Explicitly encourages agents to consult prior org experience on uncertain or high-overhead work, then selectively persist only valuable runs. Many memory systems are passive append-only or always-on.
+- **No maintenance burden like docs** — See philosophy above. The trajectory *is* the record.
+
+See the companion [org-level agent experience memory literature survey](surveys/org_level_agent_experience_memory_literature_survey.md) (50+ papers, blogs, Reddit/HN threads, frameworks) for detailed gaps analysis, comparisons to MemClaw/Mem0/A-MEM/Zep/etc., and connections to Conway's Law, transactive memory systems, and boundary objects in human–agent organizations.
 
 ## Architecture (Approach 2)
 
