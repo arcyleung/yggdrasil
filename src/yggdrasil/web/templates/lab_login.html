@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Lab login — Yggdrasil{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>Lab sign-in</h1>
+  <p>Paste your lab API key once over HTTPS. The server fingerprints it against
+    <code>user_mapping.yaml</code> / <code>KEY_NAME_MAP</code> and issues an opaque bearer token.
+    Your <code>sk-</code> key is never stored in the browser session.</p>
+  {% if error %}
+  <p class="error" role="alert">{{ error }}</p>
+  {% endif %}
+  <form method="post" action="/lab/login" class="form">
+    <label for="api_key">API key</label>
+    <input type="password" id="api_key" name="api_key" autocomplete="off" required
+           placeholder="sk-…">
+    <button type="submit">Sign in</button>
+  </form>
+</section>
+{% endblock %}
