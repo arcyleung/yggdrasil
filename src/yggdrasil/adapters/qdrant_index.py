@@ -17,7 +17,7 @@ from yggdrasil.ports.vector_index import (
     VectorSearchQuery,
 )
 from yggdrasil.adapters.qdrant_filters import compile_search_filter
-from yggdrasil.services.rrf import reciprocal_rank_fuse
+from yggdrasil.domain.rrf import reciprocal_rank_fuse
 
 # Fixed project namespace for deterministic non-UUID trajectory point IDs.
 # Never use Python hash() — it is process-/PYTHONHASHSEED-dependent.

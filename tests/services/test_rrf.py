@@ -1,5 +1,5 @@
 """RRF helper tests."""
-from yggdrasil.services.rrf import reciprocal_rank_fuse
+from yggdrasil.domain.rrf import reciprocal_rank_fuse
 
 
 def test_rrf_prefers_shared_high_ranks():
