@@ -44,6 +44,8 @@ class AppContext:
             api_key=cfg.qdrant_api_key,
             fusion=cfg.fusion,
             effort_filter_mode=cfg.effort_filter_mode,
+            w_task=cfg.w_task,
+            w_scaffold=cfg.w_scaffold,
         )
         index.ensure_collection(vector_size=cfg.embed_dim)
         view = get_embed_view(cfg.embed_view_version)

@@ -11,11 +11,20 @@ from yggdrasil.ports.vector_index import (
     VectorIndex,
     payload_from_trajectory,
 )
-from yggdrasil.services.errors import EmbedFailedError, IndexFailedError
+from yggdrasil.services.errors import EmbedFailedError, IndexFailedError, ValidationError
 
 
 def should_reembed(*, task_changed: bool, scaffold_changed: bool, is_checkpoint: bool) -> bool:
     return bool(task_changed or scaffold_changed or is_checkpoint)
+
+
+def _validate_vector_dim(vec: list[float], *, expected: int, aspect: str) -> None:
+    got = len(vec)
+    if got != expected:
+        raise ValidationError(
+            f"embedding dimension mismatch for {aspect}: got {got}, expected {expected} "
+            f"(EMBED_DIM / embedder.dimensions)"
+        )
 
 
 class EmbedService:
@@ -42,6 +51,7 @@ class EmbedService:
     ) -> NamedVectors:
         aspects = self._view.build_aspect_texts(trajectory)
         vectors = prior_vectors or NamedVectors()
+        expected_dim = self._config.embed_dim
 
         need_task = reembed or vectors.task is None
         need_scaffold = reembed or vectors.scaffold is None
@@ -64,11 +74,18 @@ class EmbedService:
                 raise EmbedFailedError(str(exc)) from exc
             updates: dict[str, list[float]] = {}
             for key, vec in zip(keys, embedded):
+                _validate_vector_dim(vec, expected=expected_dim, aspect=key)
                 updates[key] = vec
             vectors = NamedVectors(
                 task=updates.get("task", vectors.task),
                 scaffold=updates.get("scaffold", vectors.scaffold),
             )
+
+        # Also validate any prior vectors we might upsert without re-embedding
+        if vectors.task is not None:
+            _validate_vector_dim(vectors.task, expected=expected_dim, aspect="task")
+        if vectors.scaffold is not None:
+            _validate_vector_dim(vectors.scaffold, expected=expected_dim, aspect="scaffold")
 
         aspects_present: list[str] = []
         if vectors.task is not None:
