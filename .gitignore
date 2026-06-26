@@ -39,3 +39,4 @@ tmp/
 .temp/
 
 user_mapping.yaml
+.worktrees/
