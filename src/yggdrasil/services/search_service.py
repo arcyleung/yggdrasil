@@ -5,7 +5,7 @@ from typing import Any
 
 from yggdrasil.config import YggConfig
 from yggdrasil.domain.artifacts import team_identity_from_refs
-from yggdrasil.domain.enums import TrajectoryStatus
+from yggdrasil.domain.enums import IndexStatus, TrajectoryStatus
 from yggdrasil.domain.models import EffortPredicate, SearchHit, SearchScores, Trajectory
 from yggdrasil.ports.embed_view import EmbedView
 from yggdrasil.ports.embedder import Embedder
@@ -13,6 +13,11 @@ from yggdrasil.ports.store import TrajectoryStore
 from yggdrasil.ports.vector_index import VectorIndex, VectorSearchHit, VectorSearchQuery
 from yggdrasil.services.errors import EmbedFailedError, InvalidQueryError, NotFoundError
 from yggdrasil.services.retrieval_gates import GateConfig, GatedSearchResult, apply_retrieval_gates
+
+# Default search excludes trajectories that never reached a usable index.
+_DEFAULT_EXCLUDED_INDEX_STATUSES: frozenset[IndexStatus] = frozenset(
+    {IndexStatus.PENDING, IndexStatus.FAILED}
+)
 
 
 class SearchService:
@@ -91,7 +96,7 @@ class SearchService:
             workspace=ident["workspace"],
             scores=SearchScores(fused=score, fusion="rrf") if score is not None else None,
             score=score,
-            index_state=traj.index_state,
+            index_status=traj.index_status,
             embed_view_version=traj.embed_view_version,
         )
 
@@ -126,6 +131,8 @@ class SearchService:
         experience_grade_only: bool | None = None,
         # agent = strict gates; lab = include experience_grade team memory, weaker lexical gate
         search_mode: str = "agent",
+        # When False (default), drop pending/failed index_status trajectories from results.
+        include_unindexed: bool = False,
     ) -> list[SearchHit]:
         if include_attempt_history_in_embed:
             # PoC: ignored but validate embed view does not support it if explicitly wired elsewhere
@@ -200,6 +207,9 @@ class SearchService:
         for tid in ids:
             traj = by_id.get(tid)
             if traj is None:
+                continue
+            # Dual-store gate: exclude pending/failed unless caller opts in
+            if not include_unindexed and traj.index_status in _DEFAULT_EXCLUDED_INDEX_STATUSES:
                 continue
             results.append(
                 self._to_search_hit(

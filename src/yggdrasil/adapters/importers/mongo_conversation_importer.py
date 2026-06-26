@@ -1,6 +1,7 @@
 """Idempotent Mongo conversation importer into TrajectoryStore (legacy + hierarchical)."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -17,10 +18,13 @@ from yggdrasil.adapters.importers.mongo_normalize import (
 )
 from yggdrasil.adapters.importers.mongo_segment import segment_conversation_ir
 from yggdrasil.adapters.importers.segment_schema import TrajectorySegment
-from yggdrasil.domain.enums import IndexState
+from yggdrasil.domain.enums import IndexStatus
+from yggdrasil.domain.models import Step, Trajectory
 from yggdrasil.ports.store import TrajectoryStore
 from yggdrasil.services.embed_service import EmbedService
 from yggdrasil.services.errors import EmbedFailedError, IndexFailedError
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -47,6 +51,23 @@ class MongoConversationImporter:
         self._store = store
         self._embed = embed_service
 
+    def _embed_one(self, traj: Trajectory, *, reembed: bool, embed_target: bool) -> Trajectory:
+        if not (reembed and embed_target and self._embed is not None):
+            return traj
+        prior = traj.index_status
+        try:
+            self._embed.index_trajectory(traj, reembed=True)
+            return self._store.set_index_status(traj.id, IndexStatus.READY)
+        except (EmbedFailedError, IndexFailedError) as exc:
+            state = IndexStatus.STALE if prior == IndexStatus.READY else IndexStatus.FAILED
+            logger.warning(
+                "embed failed for trajectory %s → index_status=%s: %s",
+                traj.id,
+                state.value,
+                exc,
+            )
+            return self._store.set_index_status(traj.id, state)
+
     def _persist_mapped(
         self,
         mapped: MappedTrajectory,
@@ -64,15 +85,11 @@ class MongoConversationImporter:
         if force_embed is not None:
             embed_target = force_embed
         if reembed and embed_target and self._embed is not None:
-            try:
-                self._embed.index_trajectory(traj, reembed=True)
-                traj = self._store.set_index_state(traj.id, IndexState.INDEXED)
-            except (EmbedFailedError, IndexFailedError):
-                traj = self._store.set_index_state(traj.id, IndexState.STALE)
+            traj = self._embed_one(traj, reembed=True, embed_target=True)
         elif existing is None:
             try:
-                state = IndexState.PENDING if embed_target else IndexState.PENDING
-                traj = self._store.set_index_state(traj.id, state)
+                # Non-embed targets stay pending (excluded from default search)
+                traj = self._store.set_index_status(traj.id, IndexStatus.PENDING)
             except Exception:
                 pass
         mapped.trajectory = traj
@@ -98,25 +115,54 @@ class MongoConversationImporter:
         embed_parent: bool = False,
         embed_children: bool = True,
     ) -> MappedSessionHierarchy:
-        """Persist parent + children; embed children (and optionally parent)."""
-        parent = self._persist_mapped(
-            hierarchy.parent,
-            reembed=reembed and embed_parent,
-            dry_run=dry_run,
-            force_embed=embed_parent,
-        )
-        children: list[MappedTrajectory] = []
+        """Persist parent + children transactionally; embed best-effort after commit.
+
+        SQLite policy (Wave C / C4): all trajectory rows for one logical session are
+        written in a single transaction via ``upsert_imported_many`` when available.
+        Vector embeds run *after* commit so partial embed failure leaves rows queryable
+        via SQLite ``get`` with index_status failed/stale (not in default search).
+        """
+        if dry_run:
+            return hierarchy
+
+        items: list[tuple[Trajectory, list[Step]]] = [
+            (hierarchy.parent.trajectory, list(hierarchy.parent.steps)),
+        ]
         for child in hierarchy.children:
-            children.append(
-                self._persist_mapped(
-                    child,
-                    reembed=reembed and embed_children,
-                    dry_run=dry_run,
-                    force_embed=embed_children,
-                )
+            items.append((child.trajectory, list(child.steps)))
+
+        upsert_many = getattr(self._store, "upsert_imported_many", None)
+        if callable(upsert_many):
+            persisted = upsert_many(items)
+        else:
+            # Fallback: sequential commits (legacy stores)
+            persisted = [
+                self._store.upsert_imported(traj, steps) for traj, steps in items
+            ]
+
+        parent_traj = persisted[0]
+        child_trajs = persisted[1:]
+
+        # Best-effort embeds after SQLite commit
+        parent_embed = embed_parent
+        parent_traj = self._embed_one(
+            parent_traj,
+            reembed=reembed and parent_embed,
+            embed_target=parent_embed,
+        )
+        hierarchy.parent.trajectory = parent_traj
+        hierarchy.parent.steps = list(hierarchy.parent.steps)
+
+        out_children: list[MappedTrajectory] = []
+        for mapped_child, traj in zip(hierarchy.children, child_trajs):
+            traj = self._embed_one(
+                traj,
+                reembed=reembed and embed_children,
+                embed_target=embed_children,
             )
-        hierarchy.parent = parent
-        hierarchy.children = children
+            mapped_child.trajectory = traj
+            out_children.append(mapped_child)
+        hierarchy.children = out_children
         return hierarchy
 
     def import_session_aggregate(

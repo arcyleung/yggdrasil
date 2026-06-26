@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from yggdrasil.domain.artifacts import ArtifactRef, normalize_artifacts
-from yggdrasil.domain.enums import IndexState, StepKind, TrajectoryStatus
+from yggdrasil.domain.enums import IndexStatus, StepKind, TrajectoryStatus
 from yggdrasil.domain.models import EffortLedger, Outcome, Progress, RuntimeFingerprint, Step, Trajectory
 from yggdrasil.ports.store import (
     AppendStepInput,
@@ -28,7 +28,15 @@ from yggdrasil.services.errors import (
 
 
 class SessionService:
-    """Coordinates trajectory CRUD with embedding/indexing policy."""
+    """Coordinates trajectory CRUD with embedding/indexing policy.
+
+    Dual-store write policy (SQLite SoT + vector index):
+    1. Persist SQLite first (source of truth).
+    2. Attempt vector-index upsert via EmbedService.
+    3. On success → index_status=ready.
+    4. On failure → index_status=failed (or stale if previously ready);
+       start_trajectory hard-fails (raises) after marking failed.
+    """
 
     def __init__(self, store: TrajectoryStore, embed_service: EmbedService) -> None:
         self._store = store
@@ -52,14 +60,19 @@ class SessionService:
         hard_fail: bool = False,
     ) -> Trajectory:
         prior = self._vector_cache.get(traj.id)
+        prior_status = traj.index_status
         try:
             vectors = self._embed.index_trajectory(traj, reembed=reembed, prior_vectors=prior)
             self._vector_cache[traj.id] = vectors
-            return self._store.set_index_state(traj.id, IndexState.INDEXED)
+            return self._store.set_index_status(traj.id, IndexStatus.READY)
         except (EmbedFailedError, IndexFailedError):
-            state = IndexState.ERROR if hard_fail else IndexState.STALE
+            # Prefer stale when we previously had a good index; otherwise failed.
+            if prior_status == IndexStatus.READY and not hard_fail:
+                state = IndexStatus.STALE
+            else:
+                state = IndexStatus.FAILED
             try:
-                traj = self._store.set_index_state(traj.id, state)
+                traj = self._store.set_index_status(traj.id, state)
             except Exception:
                 pass
             if hard_fail:

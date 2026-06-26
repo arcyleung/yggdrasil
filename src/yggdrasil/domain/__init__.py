@@ -15,8 +15,10 @@ from yggdrasil.domain.enums import (
     EmbedAspect,
     FusionMode,
     IndexState,
+    IndexStatus,
     StepKind,
     TrajectoryStatus,
+    coerce_index_status,
 )
 from yggdrasil.domain.models import (
     EffortLedger,
@@ -45,7 +47,9 @@ __all__ = [
     "EmbedAspect",
     "FusionMode",
     "IndexState",
+    "IndexStatus",
     "Outcome",
+    "coerce_index_status",
     "Progress",
     "RuntimeFingerprint",
     "SearchHit",
