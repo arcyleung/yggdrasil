@@ -128,6 +128,7 @@ class Trajectory(BaseModel):
     effort: EffortLedger = Field(default_factory=EffortLedger)
     embed_view_version: str = "coding_v1"
     index_status: IndexStatus = IndexStatus.PENDING
+    tenant_id: str = "lab"
     created_at: datetime
     updated_at: datetime
     finalized_at: datetime | None = None
@@ -176,6 +177,7 @@ class SearchHit(BaseModel):
     agent_id: str | None = None
     team: str | None = None
     workspace: str | None = None
+    tenant_id: str | None = None
     scores: SearchScores | None = None
     score: float | None = None
     index_status: IndexStatus | None = None

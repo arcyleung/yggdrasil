@@ -59,6 +59,8 @@ class VectorPointPayload(BaseModel):
     artifact_paths: list[str] = Field(default_factory=list)
     artifact_urls: list[str] = Field(default_factory=list)
     artifact_kinds: list[str] = Field(default_factory=list)
+    # Multi-tenant isolation (mandatory filter on search when tenancy enforced)
+    tenant_id: str = "lab"
 
 class UpsertVectorPoint(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -80,6 +82,7 @@ class VectorSearchQuery(BaseModel):
     workspace: str | None = None
     require_artifacts: bool | None = None
     experience_grade_only: bool | None = None
+    tenant_id: str | None = None
     effort_predicates: list[EffortPredicate] = Field(default_factory=list)
     runtime_filters: dict[str, Any] = Field(default_factory=dict)
     limit: int = 10
@@ -111,6 +114,7 @@ def payload_from_trajectory(
     art_fields = artifact_payload_fields(trajectory.artifacts)
     tags = list(trajectory.tags)
     experience_grade = bool(refs.get("experience_grade")) or "experience_grade" in tags or "author_segmented" in tags
+    tenant_id = getattr(trajectory, "tenant_id", None) or "lab"
     return VectorPointPayload(
         trajectory_id=trajectory.id,
         domain=trajectory.domain,
@@ -156,6 +160,7 @@ def payload_from_trajectory(
         artifact_paths=list(art_fields["artifact_paths"]),
         artifact_urls=list(art_fields["artifact_urls"]),
         artifact_kinds=list(art_fields["artifact_kinds"]),
+        tenant_id=tenant_id,
     )
 
 @runtime_checkable

@@ -125,6 +125,8 @@ def compile_search_filter(
         must.append(_field_condition("has_artifacts", qm.MatchValue(value=True)))
     if query.experience_grade_only is True:
         must.append(_field_condition("experience_grade", qm.MatchValue(value=True)))
+    if query.tenant_id is not None:
+        must.append(_field_condition("tenant_id", qm.MatchValue(value=query.tenant_id)))
 
     for key, value in (query.runtime_filters or {}).items():
         if key not in RUNTIME_FILTER_FIELDS:
