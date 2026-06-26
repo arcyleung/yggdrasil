@@ -12,6 +12,7 @@ from yggdrasil.mcp.serialization import (
     trajectory_result,
 )
 from yggdrasil.services.errors import YggdrasilError
+from yggdrasil.services.principal_context import get_principal
 
 AGENT_GUIDANCE = (
     "Yggdrasil org experience memory (not doc RAG). Before work that is uncertain to succeed or has "
@@ -23,6 +24,11 @@ AGENT_GUIDANCE = (
     "search_mode=lab for org/team discovery when owner is unknown; agent mode for strict gates. "
     "get_trajectory for shortlisted depth; prefer low failure_waste_seconds."
 )
+
+
+def _tool_principal(ctx: AppContext):
+    """Prefer process-bound principal; fall back to contextvar."""
+    return ctx.principal if ctx.principal is not None else get_principal()
 
 
 def register_tools(mcp: Any, ctx: AppContext) -> None:
@@ -52,6 +58,7 @@ def register_tools(mcp: Any, ctx: AppContext) -> None:
                 external_refs=refs,
                 artifacts=artifacts,
                 embed_view_version=embed_view_version,
+                principal=_tool_principal(ctx),
             )
             return trajectory_result(traj)
         except Exception as exc:
@@ -82,6 +89,7 @@ def register_tools(mcp: Any, ctx: AppContext) -> None:
                 progress=progress,
                 mark_partial=mark_partial,
                 effort_delta=effort_delta,
+                principal=_tool_principal(ctx),
             )
             return append_step_result(result["trajectory"], result["step"])
         except Exception as exc:
@@ -106,6 +114,7 @@ def register_tools(mcp: Any, ctx: AppContext) -> None:
                 progress=progress,
                 task_text=task_text,
                 scaffold_text=scaffold_text,
+                principal=_tool_principal(ctx),
             )
             return trajectory_result(traj)
         except Exception as exc:
@@ -152,6 +161,7 @@ def register_tools(mcp: Any, ctx: AppContext) -> None:
                 experience_grade_only=experience_grade_only,
                 search_mode=search_mode,
                 include_archive=include_archive,
+                principal=_tool_principal(ctx),
             )
             payload = search_result(hits)
             gate = ctx.search_service.last_gate_result
@@ -166,7 +176,9 @@ def register_tools(mcp: Any, ctx: AppContext) -> None:
     def get_trajectory(trajectory_id: str, include_steps: bool = True) -> dict[str, Any]:
         try:
             result = ctx.session_service.get_trajectory(
-                trajectory_id, include_steps=include_steps
+                trajectory_id,
+                include_steps=include_steps,
+                principal=_tool_principal(ctx),
             )
             return get_trajectory_result(result["trajectory"], result["steps"])
         except Exception as exc:
@@ -193,6 +205,7 @@ def register_tools(mcp: Any, ctx: AppContext) -> None:
                 external_refs=external_refs,
                 artifacts=artifacts,
                 merge_artifacts=merge_artifacts,
+                principal=_tool_principal(ctx),
             )
             return trajectory_result(traj)
         except Exception as exc:

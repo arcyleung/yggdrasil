@@ -31,6 +31,7 @@ class CreateTrajectoryInput(BaseModel):
     progress: Progress | None = None
     effort: EffortLedger | None = None
     embed_view_version: str = "coding_v1"
+    tenant_id: str = "lab"
 
 class AppendStepInput(BaseModel):
     model_config = ConfigDict(extra="forbid")

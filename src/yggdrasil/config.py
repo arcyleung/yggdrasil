@@ -37,6 +37,17 @@ class YggConfig:
     mongo_creds_file: Path
     # Wave F: optional regex content scrub on write (default off for backward compat)
     scrub_content: bool = False
+    # Multi-tenant control plane
+    tenancy_mode: str = "off"  # "off" | "enforced"
+    default_tenant: str = "lab"
+    user_mapping_path: Path | None = None
+    public_base_url: str | None = None
+    ui_bind: str = "127.0.0.1:8080"
+    demo_enabled: bool = True
+    demo_owner: str = "demo"
+    demo_token: str | None = None  # optional pre-shared demo token seed
+    token_ttl_days: int = 90
+    mcp_token: str | None = None  # YGG_MCP_TOKEN for stdio principal
 
 
 def _env_get(env: Mapping[str, str], key: str, default: str | None = None) -> str | None:
@@ -95,6 +106,15 @@ def _parse_effort_filter_mode(raw: str) -> EffortFilterMode:
         raise ConfigError(f"invalid YGG_EFFORT_FILTER_MODE: {raw!r}") from exc
 
 
+def _parse_tenancy_mode(raw: str) -> str:
+    v = raw.strip().lower()
+    if v in {"off", "0", "false", "no", "legacy"}:
+        return "off"
+    if v in {"enforced", "on", "1", "true", "yes"}:
+        return "enforced"
+    raise ConfigError(f"invalid YGG_TENANCY_MODE: {raw!r} (use off|enforced)")
+
+
 def load_config(
     environ: Mapping[str, str] | None = None,
     *,
@@ -147,6 +167,21 @@ def load_config(
     if not default_domain:
         raise ConfigError("YGG_DEFAULT_DOMAIN must be non-empty")
 
+    tenancy_mode = _parse_tenancy_mode(_env_get(env, "YGG_TENANCY_MODE", "off") or "off")
+    default_tenant = (_env_get(env, "YGG_DEFAULT_TENANT", "lab") or "lab").strip() or "lab"
+    mapping_raw = (_env_get(env, "YGG_USER_MAPPING_PATH", "") or "").strip()
+    user_mapping_path = Path(mapping_raw) if mapping_raw else None
+    # Fall back to KEY_NAME_MAP path if set as a file path (handled by auth via KEY_NAME_MAP env)
+    public_base_url = _optional_secret(env, "YGG_PUBLIC_BASE_URL")
+    ui_bind = (_env_get(env, "YGG_UI_BIND", "127.0.0.1:8080") or "127.0.0.1:8080").strip()
+    demo_enabled = _parse_bool(_env_get(env, "YGG_DEMO_ENABLED", "1") or "1", field_name="YGG_DEMO_ENABLED")
+    demo_owner = (_env_get(env, "YGG_DEMO_OWNER", "demo") or "demo").strip() or "demo"
+    demo_token = _optional_secret(env, "YGG_DEMO_TOKEN")
+    token_ttl_days = _parse_positive_int(
+        _env_get(env, "YGG_TOKEN_TTL_DAYS", "90") or "90", field_name="YGG_TOKEN_TTL_DAYS"
+    )
+    mcp_token = _optional_secret(env, "YGG_MCP_TOKEN")
+
     return YggConfig(
         sqlite_path=Path(_env_get(env, "YGG_SQLITE_PATH", "./data/yggdrasil.db") or "./data/yggdrasil.db"),
         qdrant_url=qdrant_url,
@@ -169,6 +204,16 @@ def load_config(
             _env_get(env, "YGG_MONGO_CREDS_FILE", "mongo_creds.txt") or "mongo_creds.txt"
         ),
         scrub_content=scrub_content,
+        tenancy_mode=tenancy_mode,
+        default_tenant=default_tenant,
+        user_mapping_path=user_mapping_path,
+        public_base_url=public_base_url,
+        ui_bind=ui_bind,
+        demo_enabled=demo_enabled,
+        demo_owner=demo_owner,
+        demo_token=demo_token,
+        token_ttl_days=token_ttl_days,
+        mcp_token=mcp_token,
     )
 
 
@@ -195,4 +240,14 @@ def redact_config_for_log(config: YggConfig) -> dict[str, Any]:
         "embed_view_version": config.embed_view_version,
         "mongo_uri": mask(config.mongo_uri),
         "mongo_creds_file": str(config.mongo_creds_file),
+        "tenancy_mode": config.tenancy_mode,
+        "default_tenant": config.default_tenant,
+        "user_mapping_path": str(config.user_mapping_path) if config.user_mapping_path else None,
+        "public_base_url": config.public_base_url,
+        "ui_bind": config.ui_bind,
+        "demo_enabled": config.demo_enabled,
+        "demo_owner": config.demo_owner,
+        "demo_token": mask(config.demo_token),
+        "token_ttl_days": config.token_ttl_days,
+        "mcp_token": mask(config.mcp_token),
     }

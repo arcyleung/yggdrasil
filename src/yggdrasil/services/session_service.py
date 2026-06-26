@@ -1,11 +1,13 @@
 """Session lifecycle orchestration over store + embed."""
 from __future__ import annotations
 
+import logging
 from typing import Any, Sequence
 
 from yggdrasil.domain.artifacts import ArtifactRef, normalize_artifacts
 from yggdrasil.domain.enums import IndexStatus, StepKind, TrajectoryStatus
 from yggdrasil.domain.models import EffortLedger, Outcome, Progress, RuntimeFingerprint, Step, Trajectory
+from yggdrasil.domain.principal import Principal
 from yggdrasil.ports.scrubber import ContentScrubber
 from yggdrasil.ports.store import (
     AppendStepInput,
@@ -26,6 +28,9 @@ from yggdrasil.services.errors import (
     TrajectoryClosedError,
     ValidationError,
 )
+from yggdrasil.services.principal_context import get_principal
+
+logger = logging.getLogger(__name__)
 
 
 class SessionService:
@@ -41,6 +46,9 @@ class SessionService:
     Optional content scrubbing (``YGG_SCRUB_CONTENT=1``): when a ContentScrubber
     is provided, scrub task/scaffold/summary text before persist; owner names in
     external_refs are allowlisted and preserved exactly.
+
+    Multi-tenant: when a Principal is provided (or bound via contextvar),
+    owner and tenant_id are forced server-side (client spoof ignored).
     """
 
     def __init__(
@@ -49,11 +57,48 @@ class SessionService:
         embed_service: EmbedService,
         *,
         scrubber: ContentScrubber | None = None,
+        tenancy_enforced: bool = False,
+        default_tenant: str = "lab",
     ) -> None:
         self._store = store
         self._embed = embed_service
         self._scrubber = scrubber
+        self._tenancy_enforced = tenancy_enforced
+        self._default_tenant = default_tenant
         self._vector_cache: dict[str, NamedVectors] = {}
+
+    def _resolve_principal(self, principal: Principal | None) -> Principal | None:
+        if principal is not None:
+            return principal
+        return get_principal()
+
+    def _bind_refs_for_write(
+        self,
+        external_refs: dict[str, Any] | None,
+        principal: Principal | None,
+    ) -> tuple[dict[str, Any], str]:
+        """Force owner + tenant from principal when present; return (refs, tenant_id)."""
+        refs = dict(external_refs or {})
+        if principal is not None:
+            client_owner = refs.get("owner")
+            if client_owner is not None and client_owner != principal.owner:
+                logger.info(
+                    "overwriting client owner %r with principal.owner %r (token_id=%s)",
+                    client_owner,
+                    principal.owner,
+                    principal.token_id,
+                )
+            refs["owner"] = principal.owner
+            tenant_id = principal.tenant_id
+        else:
+            tenant_id = self._default_tenant
+        return refs, tenant_id
+
+    def _assert_tenant_access(self, traj: Trajectory, principal: Principal | None) -> None:
+        if principal is None:
+            return
+        if traj.tenant_id != principal.tenant_id:
+            raise NotFoundError(f"trajectory not found: {traj.id}")
 
     def _allowed_names(self, external_refs: dict[str, Any] | None) -> list[str]:
         refs = external_refs or {}
@@ -119,13 +164,23 @@ class SessionService:
         effort: EffortLedger | dict[str, Any] | None = None,
         embed_view_version: str = "coding_v1",
         trajectory_id: str | None = None,
+        principal: Principal | None = None,
+        tenant_id: str | None = None,
     ) -> Trajectory:
         if not task_text or not task_text.strip():
             raise ValidationError("task_text is required")
         if not scaffold_text or not scaffold_text.strip():
             raise ValidationError("scaffold_text is required")
 
-        refs = dict(external_refs or {})
+        principal = self._resolve_principal(principal)
+        if self._tenancy_enforced and principal is None:
+            from yggdrasil.services.auth_service import AuthError
+
+            raise AuthError("principal required when YGG_TENANCY_MODE=enforced")
+
+        refs, bound_tenant = self._bind_refs_for_write(external_refs, principal)
+        if tenant_id is not None and principal is None:
+            bound_tenant = tenant_id
         allowed = self._allowed_names(refs)
         task_text = self._scrub(task_text, allowed_names=allowed) or task_text
         scaffold_text = self._scrub(scaffold_text, allowed_names=allowed) or scaffold_text
@@ -154,6 +209,7 @@ class SessionService:
                     progress=prog,
                     effort=eff,
                     embed_view_version=embed_view_version,
+                    tenant_id=bound_tenant,
                 )
             )
         except Exception as exc:
@@ -177,7 +233,9 @@ class SessionService:
         progress: Progress | dict[str, Any] | None = None,
         mark_partial: bool = False,
         effort_delta: EffortLedger | dict[str, Any] | None = None,
+        principal: Principal | None = None,
     ) -> dict[str, Any]:
+        principal = self._resolve_principal(principal)
         if isinstance(kind, str):
             kind = StepKind(kind)
         prog = progress
@@ -189,17 +247,23 @@ class SessionService:
 
         # Allowlist owner from existing trajectory when scrubbing is on
         allowed: list[str] = []
-        if self._scrubber is not None:
+        if self._scrubber is not None or principal is not None:
             try:
                 existing = self._store.get(trajectory_id)
+                self._assert_tenant_access(existing, principal)
                 allowed = self._allowed_names(existing.external_refs)
+            except StoreTrajectoryNotFoundError as exc:
+                raise NotFoundError(f"trajectory not found: {exc.trajectory_id}") from exc
+            except NotFoundError:
+                raise
             except Exception:
                 allowed = []
-            summary = self._scrub(summary, allowed_names=allowed) or summary
-            if scaffold_update is not None:
-                scaffold_update = self._scrub(scaffold_update, allowed_names=allowed)
-            if task_update is not None:
-                task_update = self._scrub(task_update, allowed_names=allowed)
+            if self._scrubber is not None:
+                summary = self._scrub(summary, allowed_names=allowed) or summary
+                if scaffold_update is not None:
+                    scaffold_update = self._scrub(scaffold_update, allowed_names=allowed)
+                if task_update is not None:
+                    task_update = self._scrub(task_update, allowed_names=allowed)
 
         try:
             traj, step = self._store.append_step(
@@ -216,6 +280,8 @@ class SessionService:
                     effort_delta=eff,
                 )
             )
+        except (NotFoundError, ValidationError) as exc:
+            raise exc
         except Exception as exc:
             mapped = self._map_store_error(exc)
             if mapped is not exc:
@@ -240,7 +306,18 @@ class SessionService:
         progress: Progress | dict[str, Any] | None = None,
         task_text: str | None = None,
         scaffold_text: str | None = None,
+        principal: Principal | None = None,
     ) -> Trajectory:
+        principal = self._resolve_principal(principal)
+        if principal is not None:
+            try:
+                existing = self._store.get(trajectory_id)
+                self._assert_tenant_access(existing, principal)
+            except NotFoundError:
+                raise
+            except StoreTrajectoryNotFoundError as exc:
+                raise NotFoundError(f"trajectory not found: {exc.trajectory_id}") from exc
+
         if isinstance(outcome, dict):
             outcome = Outcome.model_validate(outcome)
         eff = effort
@@ -265,6 +342,8 @@ class SessionService:
                     scaffold_text=scaffold_text,
                 )
             )
+        except (NotFoundError, ValidationError) as exc:
+            raise exc
         except Exception as exc:
             mapped = self._map_store_error(exc)
             if mapped is not exc:
@@ -290,7 +369,24 @@ class SessionService:
         external_refs: dict[str, Any] | None = None,
         artifacts: list[ArtifactRef] | list[dict[str, Any]] | None = None,
         merge_artifacts: bool = True,
+        principal: Principal | None = None,
     ) -> Trajectory:
+        principal = self._resolve_principal(principal)
+        if principal is not None:
+            try:
+                existing = self._store.get(trajectory_id)
+                self._assert_tenant_access(existing, principal)
+            except NotFoundError:
+                raise
+            except StoreTrajectoryNotFoundError as exc:
+                raise NotFoundError(f"trajectory not found: {exc.trajectory_id}") from exc
+
+        # Never let client spoof owner when principal is bound
+        refs = external_refs
+        if refs is not None and principal is not None:
+            refs = dict(refs)
+            refs["owner"] = principal.owner
+
         fp = runtime_fingerprint
         if isinstance(fp, dict):
             fp = RuntimeFingerprint.model_validate(fp)
@@ -303,11 +399,13 @@ class SessionService:
                     task_text=task_text,
                     scaffold_text=scaffold_text,
                     runtime_fingerprint=fp,
-                    external_refs=external_refs,
+                    external_refs=refs,
                     artifacts=arts,
                     merge_artifacts=merge_artifacts,
                 )
             )
+        except (NotFoundError, ValidationError) as exc:
+            raise exc
         except Exception as exc:
             mapped = self._map_store_error(exc)
             if mapped is not exc:
@@ -321,12 +419,22 @@ class SessionService:
         )
         return self._index_and_mark(traj, reembed=reembed, hard_fail=False)
 
-    def get_trajectory(self, trajectory_id: str, *, include_steps: bool = True) -> dict[str, Any]:
+    def get_trajectory(
+        self,
+        trajectory_id: str,
+        *,
+        include_steps: bool = True,
+        principal: Principal | None = None,
+    ) -> dict[str, Any]:
+        principal = self._resolve_principal(principal)
         try:
             traj = self._store.get(trajectory_id)
+            self._assert_tenant_access(traj, principal)
             steps: list[Step] = []
             if include_steps:
                 steps = self._store.get_steps(trajectory_id)
+        except (NotFoundError, ValidationError) as exc:
+            raise exc
         except Exception as exc:
             mapped = self._map_store_error(exc)
             if mapped is not exc:

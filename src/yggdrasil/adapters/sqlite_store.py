@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS trajectories (
     effort_json TEXT NOT NULL DEFAULT '{}',
     embed_view_version TEXT NOT NULL DEFAULT 'coding_v1',
     index_status TEXT NOT NULL DEFAULT 'pending',
+    tenant_id TEXT NOT NULL DEFAULT 'lab',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     finalized_at TEXT
@@ -72,9 +73,23 @@ CREATE TABLE IF NOT EXISTS external_ref_index (
     FOREIGN KEY (trajectory_id) REFERENCES trajectories(id)
 );
 
+CREATE TABLE IF NOT EXISTS api_tokens (
+    token_id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    tenant_id TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    scopes_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT,
+    revoked_at TEXT,
+    label TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_steps_trajectory ON steps(trajectory_id);
 CREATE INDEX IF NOT EXISTS idx_trajectories_status ON trajectories(status);
+CREATE INDEX IF NOT EXISTS idx_trajectories_tenant_status ON trajectories(tenant_id, status);
 CREATE INDEX IF NOT EXISTS idx_external_ref_traj ON external_ref_index(trajectory_id);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash);
 """
 
 
@@ -166,6 +181,37 @@ class SqliteTrajectoryStore:
                 "UPDATE trajectories SET index_status = 'failed' WHERE index_status = 'error'"
             )
 
+        # Multi-tenant: tenant_id on trajectories (backfill existing PoC data → lab)
+        if "tenant_id" not in cols:
+            self._conn.execute(
+                "ALTER TABLE trajectories ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'lab'"
+            )
+            cols.add("tenant_id")
+        self._conn.execute(
+            "UPDATE trajectories SET tenant_id = 'lab' WHERE tenant_id IS NULL OR tenant_id = ''"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trajectories_tenant_status ON trajectories(tenant_id, status)"
+        )
+
+        # Ensure api_tokens table exists (also created in SCHEMA_SQL for new DBs)
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS api_tokens (
+                token_id TEXT PRIMARY KEY,
+                token_hash TEXT NOT NULL UNIQUE,
+                tenant_id TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                scopes_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT,
+                revoked_at TEXT,
+                label TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_api_tokens_hash ON api_tokens(token_hash);
+            """
+        )
+
     def close(self) -> None:
         self._conn.close()
 
@@ -189,6 +235,10 @@ class SqliteTrajectoryStore:
         except (KeyError, IndexError):
             artifacts_raw = []
         artifacts = [ArtifactRef.model_validate(a) for a in (artifacts_raw or [])]
+        keys = row.keys()
+        tenant_id = "lab"
+        if "tenant_id" in keys and row["tenant_id"]:
+            tenant_id = str(row["tenant_id"])
         return Trajectory(
             id=row["id"],
             domain=row["domain"],
@@ -204,6 +254,7 @@ class SqliteTrajectoryStore:
             effort=EffortLedger.model_validate(effort_raw or {}),
             embed_view_version=row["embed_view_version"],
             index_status=self._row_index_status(row),
+            tenant_id=tenant_id,
             created_at=_dt_from_str(row["created_at"]) or _utcnow(),
             updated_at=_dt_from_str(row["updated_at"]) or _utcnow(),
             finalized_at=_dt_from_str(row["finalized_at"]),
@@ -230,8 +281,8 @@ class SqliteTrajectoryStore:
                 id, domain, status, task_text, scaffold_text,
                 runtime_fingerprint_json, tags_json, external_refs_json, artifacts_json,
                 progress_json, outcome_json, effort_json,
-                embed_view_version, index_status, created_at, updated_at, finalized_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                embed_view_version, index_status, tenant_id, created_at, updated_at, finalized_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 traj.id,
@@ -248,6 +299,7 @@ class SqliteTrajectoryStore:
                 _json_dumps(traj.effort),
                 traj.embed_view_version,
                 traj.index_status.value,
+                traj.tenant_id or "lab",
                 _dt_to_str(traj.created_at),
                 _dt_to_str(traj.updated_at),
                 _dt_to_str(traj.finalized_at),
@@ -262,7 +314,8 @@ class SqliteTrajectoryStore:
                 runtime_fingerprint_json = ?, tags_json = ?, external_refs_json = ?,
                 artifacts_json = ?,
                 progress_json = ?, outcome_json = ?, effort_json = ?,
-                embed_view_version = ?, index_status = ?, updated_at = ?, finalized_at = ?
+                embed_view_version = ?, index_status = ?, tenant_id = ?,
+                updated_at = ?, finalized_at = ?
             WHERE id = ?
             """,
             (
@@ -279,6 +332,7 @@ class SqliteTrajectoryStore:
                 _json_dumps(traj.effort),
                 traj.embed_view_version,
                 traj.index_status.value,
+                traj.tenant_id or "lab",
                 _dt_to_str(traj.updated_at),
                 _dt_to_str(traj.finalized_at),
                 traj.id,
@@ -322,6 +376,7 @@ class SqliteTrajectoryStore:
             effort=effort,
             embed_view_version=data.embed_view_version,
             index_status=IndexStatus.PENDING,
+            tenant_id=data.tenant_id or "lab",
             created_at=now,
             updated_at=now,
             finalized_at=None,
@@ -331,13 +386,22 @@ class SqliteTrajectoryStore:
         self._conn.commit()
         return traj
 
-    def get(self, trajectory_id: str) -> Trajectory:
+    def get(self, trajectory_id: str, *, tenant_id: str | None = None) -> Trajectory:
         row = self._conn.execute(
             "SELECT * FROM trajectories WHERE id = ?", (trajectory_id,)
         ).fetchone()
         if row is None:
             raise TrajectoryNotFoundError(trajectory_id)
-        return self._row_to_trajectory(row)
+        traj = self._row_to_trajectory(row)
+        if tenant_id is not None and traj.tenant_id != tenant_id:
+            # Hide cross-tenant existence (same as not found for callers)
+            raise TrajectoryNotFoundError(trajectory_id)
+        return traj
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """Expose connection for co-located token store on the same DB."""
+        return self._conn
 
     def get_steps(self, trajectory_id: str) -> list[Step]:
         self.get(trajectory_id)  # ensure exists

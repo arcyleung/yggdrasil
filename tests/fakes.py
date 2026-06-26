@@ -88,6 +88,8 @@ class FakeVectorIndex:
                 continue
             if query.experience_grade_only is True and not payload.experience_grade:
                 continue
+            if query.tenant_id is not None and getattr(payload, "tenant_id", "lab") != query.tenant_id:
+                continue
             # Trivial relevance: always score 1.0 (payload-filter oriented fake)
             hits.append(VectorSearchHit(trajectory_id=tid, score=1.0, payload=payload))
         hits.sort(key=lambda h: h.trajectory_id)

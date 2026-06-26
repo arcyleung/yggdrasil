@@ -7,11 +7,13 @@ from yggdrasil.config import YggConfig
 from yggdrasil.domain.artifacts import team_identity_from_refs
 from yggdrasil.domain.enums import IndexStatus, TrajectoryStatus
 from yggdrasil.domain.models import EffortPredicate, SearchHit, SearchScores, Trajectory
+from yggdrasil.domain.principal import Principal
 from yggdrasil.ports.embed_view import EmbedView
 from yggdrasil.ports.embedder import Embedder
 from yggdrasil.ports.store import TrajectoryStore
 from yggdrasil.ports.vector_index import VectorIndex, VectorSearchHit, VectorSearchQuery
 from yggdrasil.services.errors import EmbedFailedError, InvalidQueryError, NotFoundError
+from yggdrasil.services.principal_context import get_principal
 from yggdrasil.services.retrieval_gates import GateConfig, GatedSearchResult, apply_retrieval_gates
 
 # Default search excludes trajectories that never reached a usable index.
@@ -33,6 +35,7 @@ class SearchService:
         *,
         gate_config: GateConfig | None = None,
         apply_gates_default: bool = True,
+        tenancy_enforced: bool = False,
     ) -> None:
         self._store = store
         self._embedder = embedder
@@ -41,6 +44,7 @@ class SearchService:
         self._config = config
         self._gate_config = gate_config or GateConfig()
         self._apply_gates_default = apply_gates_default
+        self._tenancy_enforced = tenancy_enforced
         self._last_gate_result: GatedSearchResult | None = None
 
     def _coerce_status_in(
@@ -94,6 +98,7 @@ class SearchService:
             agent_id=ident["agent_id"],
             team=ident["team"],
             workspace=ident["workspace"],
+            tenant_id=getattr(traj, "tenant_id", None) or "lab",
             scores=SearchScores(fused=score, fusion="rrf") if score is not None else None,
             score=score,
             index_status=traj.index_status,
@@ -133,10 +138,24 @@ class SearchService:
         search_mode: str = "agent",
         # When False (default), drop pending/failed index_status trajectories from results.
         include_unindexed: bool = False,
+        principal: Principal | None = None,
+        tenant_id: str | None = None,
     ) -> list[SearchHit]:
         if include_attempt_history_in_embed:
             # PoC: ignored but validate embed view does not support it if explicitly wired elsewhere
             pass
+
+        principal = principal if principal is not None else get_principal()
+        if self._tenancy_enforced and principal is None:
+            from yggdrasil.services.auth_service import AuthError
+
+            raise AuthError("principal required when YGG_TENANCY_MODE=enforced")
+        # Lab shares org scope: filter by tenant only, never force owner from principal.
+        effective_tenant = tenant_id
+        if principal is not None:
+            effective_tenant = principal.tenant_id
+        elif self._tenancy_enforced:
+            effective_tenant = getattr(self._config, "default_tenant", "lab")
 
         task_q = task.strip() if task and task.strip() else None
         scaffold_q = scaffold.strip() if scaffold and scaffold.strip() else None
@@ -188,6 +207,7 @@ class SearchService:
             workspace=workspace,
             require_artifacts=require_artifacts,
             experience_grade_only=experience_grade_only,
+            tenant_id=effective_tenant,
             effort_predicates=self._coerce_effort_predicates(effort_predicates),
             runtime_filters=dict(runtime_filters or {}),
             limit=fetch_limit,
@@ -207,6 +227,8 @@ class SearchService:
         for tid in ids:
             traj = by_id.get(tid)
             if traj is None:
+                continue
+            if effective_tenant is not None and getattr(traj, "tenant_id", "lab") != effective_tenant:
                 continue
             # Dual-store gate: exclude pending/failed unless caller opts in
             if not include_unindexed and traj.index_status in _DEFAULT_EXCLUDED_INDEX_STATUSES:
