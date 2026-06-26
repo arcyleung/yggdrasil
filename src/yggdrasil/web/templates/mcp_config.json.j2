@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "yggdrasil": {
+      "url": "{{ mcp_url }}",
+      "headers": {
+        "Authorization": "Bearer {{ bearer_token }}"
+      }
+    }
+  },
+  "_yggdrasil": {
+    "public_base_url": "{{ public_base_url }}",
+    "owner": "{{ owner }}",
+    "tenant_id": "{{ tenant_id }}",
+    "note": "Remote MCP HTTP gateway may return 501 until multi-tenant ships; token is valid for exchange/auth."
+  }
+}

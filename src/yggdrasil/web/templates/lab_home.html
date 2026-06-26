@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Lab home — Yggdrasil{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>Welcome, {{ owner }}</h1>
+  <p>Tenant: <code>{{ tenant_id }}</code>
+    {% if token_id %} · token id: <code>{{ token_id }}</code>{% endif %}
+  </p>
+  <p class="note">Lab users share <strong>org-wide</strong> experience memory (all owners in the map).
+    Writes still bind your owner server-side.</p>
+
+  <div class="actions">
+    <a class="btn" href="/lab/skill.md">Download skill.md</a>
+    <a class="btn" href="/lab/mcp.json">Download mcp.json</a>
+  </div>
+
+  <details class="token-reveal">
+    <summary>Show bearer token (for MCP clients)</summary>
+    <pre class="token">{{ bearer_token }}</pre>
+    <p class="note">This is the issued Yggdrasil token, not your API key.</p>
+  </details>
+
+  <form method="post" action="/lab/logout" class="form inline">
+    <button type="submit" class="btn-secondary">Sign out</button>
+  </form>
+</section>
+{% endblock %}

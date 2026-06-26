@@ -1,0 +1,50 @@
+---
+name: yggdrasil-trajectory-memory
+description: >
+  Org-wide agent experience memory for the lab tenant. Search before uncertain or
+  high-overhead work; write trajectories with owner attribution. Connect via remote MCP.
+---
+
+# Yggdrasil Trajectory Experience Memory (Lab)
+
+You are using **Yggdrasil** for tenant **`{{ tenant_id }}`** as owner **`{{ owner }}`**.
+
+## Connection
+
+- **Public base URL:** `{{ public_base_url }}`
+- **MCP endpoint:** `{{ mcp_url }}`
+- **Authorization:** `Bearer {{ bearer_token }}`
+
+Configure your MCP client with the downloaded `mcp.json` (or equivalent) using the bearer token above.
+Do **not** paste lab `sk-` API keys into agent configs — use this issued token only.
+
+## Org-wide experience discovery
+
+Lab users share **one retrieval scope** (`tenant_id=lab`). Search returns experiences from **all lab owners**.
+Writes still bind **your** owner (`{{ owner }}`) server-side — clients cannot spoof owner or tenant.
+
+**Default reflex:** Before work that is uncertain to succeed or has large research/setup overhead,
+call `search_strategies` (search_experience) first. Surface hit **owner** / **agent_id** so the user
+can follow up in person. After non-trivial sessions, write with `start_trajectory` / `append_step` /
+`finalize_trajectory`.
+
+## Core policies
+
+- Embed only **current** task + scaffold — never full retry transcripts into embed fields.
+- Always report **owner** on useful hits for human handoff.
+- Prefer `search_mode="lab"` for org discovery; use `prefer_low_waste: true` when useful.
+- Segment long multi-goal sessions into separate trajectories.
+
+## MCP tools (essentials)
+
+- `search_strategies` — task, scaffold, search_mode, limit, prefer_low_waste
+- `start_trajectory` — task_text, scaffold_text, external_refs (owner forced server-side), artifacts
+- `append_step` / `finalize_trajectory` / `get_trajectory` / `update_trajectory_meta`
+
+## Quick checklist
+
+1. Uncertain/high-overhead? → `search_strategies` with current task/scaffold only.
+2. Good hits? → name the `owner` for the user.
+3. Worth preserving? → write trajectory (owner bound to `{{ owner }}`).
+4. Long session? → segment before writing.
+5. Done? → finalize with real outcome + effort.

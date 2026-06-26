@@ -1,0 +1,29 @@
+---
+name: yggdrasil-trajectory-memory-demo
+description: >
+  Demo tenant experience memory (isolated from lab). Read-heavy trial; limited writes to demo only.
+---
+
+# Yggdrasil Demo Tenant
+
+You are using the **demo** tenant as owner **`{{ owner }}`**.
+
+## Isolation
+
+- Retrieval is restricted to `tenant_id=demo` trajectories only.
+- **Never** returns lab org data.
+- Writes (if allowed) are demo-only and may be rate-limited.
+
+## Connection
+
+- **Public base URL:** `{{ public_base_url }}`
+- **MCP endpoint:** `{{ mcp_url }}`
+- **Authorization:** `Bearer {{ bearer_token }}`
+
+## Suggested usage
+
+1. Call `search_strategies` with a trial task to see seeded demo experiences.
+2. Optionally write a short demo trajectory; it stays in the demo tenant.
+3. Prefer read/explore over large write volume in demo.
+
+This is a **trial** environment — do not store sensitive lab data here.

@@ -29,6 +29,19 @@ Key differentiators:
 
 See the companion [org-level agent experience memory literature survey](surveys/org_level_agent_experience_memory_literature_survey.md) (50+ papers, blogs, Reddit/HN threads, frameworks) for detailed gaps analysis, comparisons to MemClaw/Mem0/A-MEM/Zep/etc., and connections to Conway's Law, transactive memory systems, and boundary objects in human–agent organizations.
 
+## Control plane UI
+
+FastAPI + Jinja control plane for lab/demo sign-in and personalized skill / MCP config download:
+
+```bash
+pip install -e ".[web,dev]"
+export YGG_PUBLIC_BASE_URL=http://127.0.0.1:8080
+export KEY_NAME_MAP='{"sk-test":"alice"}'   # or YGG_USER_MAPPING_PATH=user_mapping.yaml
+uvicorn yggdrasil.web.app:app --host 127.0.0.1 --port 8080
+```
+
+Tailscale Funnel / DDNS: see [`docs/superpowers/runbooks/tailscale-funnel.md`](docs/superpowers/runbooks/tailscale-funnel.md).
+
 ## Architecture (Approach 2)
 
 | Layer | Role |
