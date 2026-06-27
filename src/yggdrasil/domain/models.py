@@ -129,6 +129,8 @@ class Trajectory(BaseModel):
     embed_view_version: str = "coding_v1"
     index_status: IndexStatus = IndexStatus.PENDING
     tenant_id: str = "lab"
+    schema_version: int = 4
+    occurred_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
     finalized_at: datetime | None = None
@@ -182,6 +184,8 @@ class SearchHit(BaseModel):
     score: float | None = None
     index_status: IndexStatus | None = None
     embed_view_version: str | None = None
+    updated_at: datetime | None = None
+    finalized_at: datetime | None = None
 
     @property
     def index_state(self) -> IndexStatus | None:

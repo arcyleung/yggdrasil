@@ -67,7 +67,7 @@ This single document is enough to connect and try Yggdrasil — no separate `mcp
 | **Tenant** | `demo` (isolated; never lab data) |
 | **Owner** | `{{ owner }}` |
 
-If remote HTTP returns **501**, use stdio with `YGG_MCP_TOKEN` set to the bearer above.
+Remote HTTP MCP uses Bearer auth on this URL (Streamable HTTP). If initialize fails, fall back to stdio with `YGG_MCP_TOKEN` set to the bearer above.
 
 ---
 

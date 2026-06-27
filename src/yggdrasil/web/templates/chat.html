@@ -105,13 +105,21 @@
       } catch (_) { append(e.data); }
     });
     es.addEventListener('status', function (e) {
-      statusEl.textContent = 'Running…';
+      try {
+        const j = JSON.parse(e.data || '{}');
+        statusEl.textContent = j.phase ? ('Running… (' + j.phase + ')') : (j.text || 'Running…');
+      } catch (_) {
+        statusEl.textContent = 'Running…';
+      }
+    });
+    es.addEventListener('event', function (e) {
+      /* ignore noisy lifecycle blobs; prefer message/tool */
     });
     es.addEventListener('error', function (e) {
       if (e.data) {
         try {
           const j = JSON.parse(e.data);
-          append('[error] ' + (j.message || e.data));
+          append('[error] ' + (j.message || j.text || e.data));
         } catch (_) { append('[error] ' + e.data); }
       }
     });

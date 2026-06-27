@@ -61,6 +61,14 @@ class VectorPointPayload(BaseModel):
     artifact_kinds: list[str] = Field(default_factory=list)
     # Multi-tenant isolation (mandatory filter on search when tenancy enforced)
     tenant_id: str = "lab"
+    # Versioned projection (v4+ attribution / event time)
+    payload_schema_version: int = 4
+    schema_version: int = 4
+    multilane_bprime: bool = False
+    occurred_at: datetime | None = None
+    occurred_at_ts: int | None = None
+    updated_at_ts: int | None = None
+    created_at_ts: int | None = None
 
 class UpsertVectorPoint(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -113,7 +121,12 @@ def payload_from_trajectory(
     ident = team_identity_from_refs(refs)
     art_fields = artifact_payload_fields(trajectory.artifacts)
     tags = list(trajectory.tags)
-    experience_grade = bool(refs.get("experience_grade")) or "experience_grade" in tags or "author_segmented" in tags
+    experience_grade = (
+        bool(refs.get("experience_grade"))
+        or "experience_grade" in tags
+        or "author_segmented" in tags
+        or "multilane_bprime" in tags
+    )
     tenant_id = getattr(trajectory, "tenant_id", None) or "lab"
     return VectorPointPayload(
         trajectory_id=trajectory.id,
@@ -161,7 +174,25 @@ def payload_from_trajectory(
         artifact_urls=list(art_fields["artifact_urls"]),
         artifact_kinds=list(art_fields["artifact_kinds"]),
         tenant_id=tenant_id,
+        payload_schema_version=4,
+        schema_version=int(getattr(trajectory, "schema_version", 4) or 4),
+        multilane_bprime=("multilane_bprime" in tags)
+        or bool(refs.get("multilane_policy")),
+        occurred_at=getattr(trajectory, "occurred_at", None),
+        occurred_at_ts=_dt_ts(getattr(trajectory, "occurred_at", None)),
+        updated_at_ts=_dt_ts(trajectory.updated_at),
+        created_at_ts=_dt_ts(trajectory.created_at),
     )
+
+
+def _dt_ts(dt: datetime | None) -> int | None:
+    if dt is None:
+        return None
+    try:
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
 
 @runtime_checkable
 class VectorIndex(Protocol):

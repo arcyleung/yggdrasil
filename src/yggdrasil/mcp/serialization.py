@@ -43,5 +43,31 @@ def append_step_result(traj: Trajectory, step: Step) -> dict[str, Any]:
     }
 
 
-def search_result(hits: list[SearchHit]) -> dict[str, Any]:
-    return {"hits": [search_hit_to_dict(h) for h in hits], "count": len(hits)}
+def search_result(
+    hits: list[SearchHit],
+    *,
+    query_task: str | None = None,
+    prefer_low_waste: bool = True,
+) -> dict[str, Any]:
+    from yggdrasil.services.retrieval_gates import group_ranked_by_range, rank_experience_hits
+
+    ranked = rank_experience_hits(
+        hits, query_task=query_task, prefer_low_waste=prefer_low_waste
+    )
+    return {
+        "hits": [search_hit_to_dict(h) for h in hits],
+        "count": len(hits),
+        # Agent-facing structured table (recency × success × relevance)
+        "ranked": ranked,
+        "by_range": group_ranked_by_range(ranked),
+        "presentation": {
+            "format": "experience_table_v1",
+            "rank_order": ["outcome_success", "recency", "relevance_score", "low_waste"],
+            "ranges": ["today", "week", "month", "older", "unknown"],
+            "agent_instruction": (
+                "Present ranked[] as a markdown table (range | owner | agent_id | outcome | "
+                "trajectory_id | task preview | score). Prefer by_range buckets when the user "
+                "asks time-based questions. Always name owners for human follow-up."
+            ),
+        },
+    }

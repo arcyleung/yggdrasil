@@ -122,8 +122,145 @@ def hit_claims_experience_grade(hit: SearchHit) -> bool:
     tags = set(hit.tags or [])
     if "experience_grade" in tags or "author_segmented" in tags:
         return True
+    # B′ multi-lane imports are org experience (not hydration_test archive)
+    if "multilane_bprime" in tags or "session_lane_slice" in tags:
+        return True
     refs = hit.external_refs or {}
-    return bool(refs.get("experience_grade"))
+    return bool(refs.get("experience_grade") or refs.get("multilane_policy"))
+
+
+def time_range_label(when: Any) -> str:
+    """Bucket a datetime (or ISO string) into today | week | month | older | unknown."""
+    from datetime import datetime, timedelta, timezone
+
+    if when is None:
+        return "unknown"
+    if isinstance(when, str):
+        try:
+            when = datetime.fromisoformat(when.replace("Z", "+00:00"))
+        except ValueError:
+            return "unknown"
+    if not isinstance(when, datetime):
+        return "unknown"
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    age = now - when
+    if age <= timedelta(days=1):
+        return "today"
+    if age <= timedelta(days=7):
+        return "week"
+    if age <= timedelta(days=30):
+        return "month"
+    return "older"
+
+
+def outcome_rank(status: str | None) -> int:
+    """Higher is better for ranking (success > partial > open > fail > unknown)."""
+    s = (status or "").lower()
+    if s == "success":
+        return 4
+    if s in ("partial", "open"):
+        return 3
+    if s == "aborted":
+        return 2
+    if s == "fail":
+        return 1
+    return 0
+
+
+def rank_experience_hits(
+    hits: list[SearchHit],
+    *,
+    query_task: str | None = None,
+    prefer_low_waste: bool = True,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Rank hits for org discovery: recency, success, relevance (score + token overlap).
+
+    Returns structured rows suitable for agent tables / time-bucket presentation.
+    """
+    from datetime import datetime, timezone
+
+    rows: list[dict[str, Any]] = []
+    for h in hits:
+        refs = h.external_refs or {}
+        owner = h.owner or refs.get("owner") or "unknown"
+        agent_id = h.agent_id or refs.get("agent_id")
+        team = h.team or refs.get("team")
+        when = h.updated_at or h.finalized_at
+        if when is None:
+            when = refs.get("updated_at") or refs.get("finalized_at")
+        status = None
+        if h.outcome is not None:
+            ts = getattr(h.outcome, "terminal_status", None)
+            status = ts.value if hasattr(ts, "value") else (str(ts) if ts else None)
+        status = status or (h.status.value if hasattr(h.status, "value") else str(h.status))
+        overlap = token_overlap_score(query_task, h.task_text)
+        score = float(h.score or 0.0)
+        waste = None
+        if h.effort_totals is not None:
+            waste = h.effort_totals.failure_waste_seconds
+        # Composite: success tier, recency (newer = smaller age key), relevance, low waste
+        range_label = time_range_label(when)
+        range_rank = {"today": 4, "week": 3, "month": 2, "older": 1, "unknown": 0}.get(
+            range_label, 0
+        )
+        waste_key = waste if waste is not None else (0.0 if prefer_low_waste else 0.0)
+        # For prefer_low_waste, lower waste is better → negate later in sort
+        rows.append(
+            {
+                "range": range_label,
+                "owner": owner,
+                "agent_id": agent_id,
+                "team": team,
+                "trajectory_id": h.trajectory_id,
+                "trajectory": {
+                    "id": h.trajectory_id,
+                    "task_text": (h.task_text or "")[:500],
+                    "scaffold_text": (h.scaffold_text or "")[:300],
+                    "score": score,
+                    "tags": list(h.tags or [])[:20],
+                },
+                "outcome": status,
+                "relevance_score": score,
+                "token_overlap": round(overlap, 4),
+                "failure_waste_seconds": waste,
+                "updated_at": when.isoformat()
+                if isinstance(when, datetime)
+                else (str(when) if when else None),
+                "_sort": (
+                    outcome_rank(status),
+                    range_rank,
+                    score,
+                    overlap,
+                    -(waste_key if prefer_low_waste and waste_key is not None else 0.0),
+                ),
+            }
+        )
+    rows.sort(key=lambda r: r["_sort"], reverse=True)
+    for r in rows:
+        del r["_sort"]
+    if limit is not None:
+        rows = rows[:limit]
+    return rows
+
+
+def group_ranked_by_range(ranked: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Group ranked rows into today / week / month / older / unknown lists (order preserved)."""
+    out: dict[str, list[dict[str, Any]]] = {
+        "today": [],
+        "week": [],
+        "month": [],
+        "older": [],
+        "unknown": [],
+    }
+    for r in ranked:
+        key = r.get("range") or "unknown"
+        if key not in out:
+            key = "unknown"
+        out[key].append(r)
+    return out
 
 
 @dataclass
@@ -208,8 +345,13 @@ def apply_retrieval_gates(
                     reasons.append(f"no_token_overlap:{overlap:.3f}")
 
         if reasons:
-            if cfg.demote_noisy_instead_of_drop and "noisy_or_short_task_text" in reasons:
-                # keep but sort later with penalty — append with note in dropped only
+            # Lab wide-recall: keep noisy tasks with a penalty, but never keep archive excludes
+            has_exclude = any(str(r).startswith("excluded_tags") for r in reasons)
+            if (
+                cfg.demote_noisy_instead_of_drop
+                and "noisy_or_short_task_text" in reasons
+                and not has_exclude
+            ):
                 kept.append(h)
                 dropped.append(
                     {

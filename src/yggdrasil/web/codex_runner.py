@@ -84,10 +84,10 @@ def build_codex_argv(
         str(cwd),
         # Prefer read-only sandbox for web-driven chat unless overridden
         "-s",
-        os.environ.get("YGG_CODEX_SANDBOX", "read-only"),
+        os.environ.get("YGG_CODEX_SANDBOX", "workspace-write"),
         # Point Codex at skills dir (project-relative may vary; pass as config if supported)
         "-c",
-        f'project_doc_fallback_filenames=["SKILL.md"]',
+        'project_doc_fallback_filenames=["SKILL.md"]',
     ]
     # Instruct agent to load skill text via AGENTS-style: we also prepend skill path in prompt
     if model:
@@ -100,48 +100,81 @@ def build_codex_argv(
     # Prompt includes skill reminder; skill file lives in cwd/skills or skill_dir
     skill_hint = (
         f"You have the Yggdrasil trajectory-memory skill enabled "
-        f"(see {skill_dir / 'SKILL.md'}). Use Yggdrasil MCP tools when relevant "
-        f"(search_strategies before uncertain/high-overhead work; surface owners).\n\n"
+        f"(see {skill_dir / 'SKILL.md'}). Prefer Yggdrasil MCP tools when relevant "
+        f"(search_strategies before uncertain/high-overhead work; surface owners). "
+        f"Answer the user request directly and completely.\n\n"
         f"User request:\n{prompt}"
     )
+    # End-of-options so prompt never looks like a flag; avoid "-" alone (means read stdin)
+    argv.append("--")
     argv.append(skill_hint)
     return argv
 
 
 def _classify_json_line(obj: dict[str, Any]) -> tuple[str, str]:
     """Map Codex JSONL event to (sse_event_name, text)."""
-    # Best-effort across Codex versions
     typ = str(obj.get("type") or obj.get("event") or obj.get("kind") or "")
+    tl = typ.lower()
+    item = obj.get("item") if isinstance(obj.get("item"), dict) else None
+    item_type = str((item or {}).get("type") or "").lower()
+
+    # Nested agent message (Codex 0.x JSONL: item.completed + item.type=agent_message)
+    if item is not None:
+        msg = item.get("text") or item.get("content") or item.get("summary")
+        if isinstance(msg, dict):
+            msg = msg.get("text") or msg.get("content") or json.dumps(msg)
+        text_item = msg if isinstance(msg, str) else ""
+        if "agent_message" in item_type or item_type in ("message", "assistant_message"):
+            return "message", text_item
+        if "reasoning" in item_type or "thought" in item_type:
+            return "reasoning", text_item
+        if "command" in item_type or "tool" in item_type or "mcp" in item_type:
+            return "tool", text_item or item_type
+        if text_item and "completed" in tl:
+            # Generic completed item with text — treat as assistant output
+            return "message", text_item
+
     msg = obj.get("message") or obj.get("text") or obj.get("delta") or obj.get("content")
     if isinstance(msg, dict):
         msg = msg.get("text") or msg.get("content") or json.dumps(msg)
-    if msg is None and "item" in obj:
-        item = obj["item"]
-        if isinstance(item, dict):
-            msg = item.get("text") or item.get("content") or item.get("summary")
     if msg is None:
-        # agent message / reasoning fields
         for key in ("agent_message", "last_agent_message", "reasoning", "output"):
             if key in obj and obj[key]:
                 msg = obj[key]
                 break
-    text = msg if isinstance(msg, str) else (json.dumps(obj, ensure_ascii=False) if obj else "")
-    tl = typ.lower()
+    text = msg if isinstance(msg, str) else ""
+
     if "error" in tl or obj.get("error"):
         return "error", text or str(obj.get("error") or typ)
+    if tl in ("turn.started", "thread.started", "turn.completed"):
+        # Lifecycle — optional status, not user-visible "done" (that closes the SSE UI)
+        if tl == "turn.completed":
+            return "status", text or "turn completed"
+        return "status", text or typ
     if "message" in tl or "agent_message" in tl or "assistant" in tl:
         return "message", text
     if "reasoning" in tl or "thought" in tl:
         return "reasoning", text
-    if "tool" in tl or "command" in tl or "exec" in tl:
+    if "tool" in tl or "command" in tl or ("exec" in tl and "item" not in tl):
         return "tool", text or typ
-    if "result" in tl or "completed" in tl or "done" in tl:
-        return "done", text or typ
-    if text and typ:
-        return "event", f"[{typ}] {text}" if text else typ
+    # Do not map item.completed / turn.completed to SSE "done" — UI treats done as stream end
     if text:
         return "log", text
+    if typ:
+        return "status", typ
     return "event", json.dumps(obj, ensure_ascii=False)[:2000]
+
+
+def _stderr_is_noise(text: str) -> bool:
+    t = text.strip().lower()
+    if not t:
+        return True
+    # Codex prints this when stdin is not a TTY even if prompt is on argv (DEVNULL).
+    if "reading additional input from stdin" in t:
+        return True
+    if t.startswith("reading additional input"):
+        return True
+    return False
 
 
 async def stream_codex_exec(
@@ -225,16 +258,6 @@ async def stream_codex_exec(
         assert proc.stdout is not None
         assert proc.stderr is not None
 
-        async def _pump_stderr() -> None:
-            assert proc.stderr is not None
-            while True:
-                line = await proc.stderr.readline()
-                if not line:
-                    break
-                text = line.decode("utf-8", errors="replace").rstrip()
-                if text:
-                    yield_queue.put_nowait({"event": "log", "data": json.dumps({"stream": "stderr", "text": text})})
-
         yield_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
 
         async def stderr_task() -> None:
@@ -245,7 +268,7 @@ async def stream_codex_exec(
                     if not line:
                         break
                     text = line.decode("utf-8", errors="replace").rstrip()
-                    if text:
+                    if text and not _stderr_is_noise(text):
                         await yield_queue.put(
                             {"event": "log", "data": json.dumps({"stream": "stderr", "text": text})}
                         )

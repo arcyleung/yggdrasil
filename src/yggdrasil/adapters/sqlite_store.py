@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS trajectories (
     embed_view_version TEXT NOT NULL DEFAULT 'coding_v1',
     index_status TEXT NOT NULL DEFAULT 'pending',
     tenant_id TEXT NOT NULL DEFAULT 'lab',
+    schema_version INTEGER NOT NULL DEFAULT 4,
+    occurred_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     finalized_at TEXT
@@ -195,6 +197,22 @@ class SqliteTrajectoryStore:
             "CREATE INDEX IF NOT EXISTS idx_trajectories_tenant_status ON trajectories(tenant_id, status)"
         )
 
+        # v4: explicit schema_version + event-time occurred_at
+        if "schema_version" not in cols:
+            self._conn.execute(
+                "ALTER TABLE trajectories ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1"
+            )
+            cols.add("schema_version")
+        if "occurred_at" not in cols:
+            self._conn.execute("ALTER TABLE trajectories ADD COLUMN occurred_at TEXT")
+            cols.add("occurred_at")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trajectories_schema_version ON trajectories(schema_version)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trajectories_occurred_at ON trajectories(occurred_at)"
+        )
+
         # Ensure api_tokens table exists (also created in SCHEMA_SQL for new DBs)
         self._conn.executescript(
             """
@@ -240,6 +258,12 @@ class SqliteTrajectoryStore:
         tenant_id = "lab"
         if "tenant_id" in keys and row["tenant_id"]:
             tenant_id = str(row["tenant_id"])
+        schema_version = 1
+        if "schema_version" in keys and row["schema_version"] is not None:
+            schema_version = int(row["schema_version"])
+        occurred_at = None
+        if "occurred_at" in keys and row["occurred_at"]:
+            occurred_at = _dt_from_str(row["occurred_at"])
         return Trajectory(
             id=row["id"],
             domain=row["domain"],
@@ -256,6 +280,8 @@ class SqliteTrajectoryStore:
             embed_view_version=row["embed_view_version"],
             index_status=self._row_index_status(row),
             tenant_id=tenant_id,
+            schema_version=schema_version,
+            occurred_at=occurred_at,
             created_at=_dt_from_str(row["created_at"]) or _utcnow(),
             updated_at=_dt_from_str(row["updated_at"]) or _utcnow(),
             finalized_at=_dt_from_str(row["finalized_at"]),
@@ -282,8 +308,9 @@ class SqliteTrajectoryStore:
                 id, domain, status, task_text, scaffold_text,
                 runtime_fingerprint_json, tags_json, external_refs_json, artifacts_json,
                 progress_json, outcome_json, effort_json,
-                embed_view_version, index_status, tenant_id, created_at, updated_at, finalized_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                embed_view_version, index_status, tenant_id, schema_version, occurred_at,
+                created_at, updated_at, finalized_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 traj.id,
@@ -301,6 +328,8 @@ class SqliteTrajectoryStore:
                 traj.embed_view_version,
                 traj.index_status.value,
                 traj.tenant_id or "lab",
+                int(getattr(traj, "schema_version", 4) or 4),
+                _dt_to_str(getattr(traj, "occurred_at", None)),
                 _dt_to_str(traj.created_at),
                 _dt_to_str(traj.updated_at),
                 _dt_to_str(traj.finalized_at),
@@ -316,6 +345,7 @@ class SqliteTrajectoryStore:
                 artifacts_json = ?,
                 progress_json = ?, outcome_json = ?, effort_json = ?,
                 embed_view_version = ?, index_status = ?, tenant_id = ?,
+                schema_version = ?, occurred_at = ?,
                 updated_at = ?, finalized_at = ?
             WHERE id = ?
             """,
@@ -334,6 +364,8 @@ class SqliteTrajectoryStore:
                 traj.embed_view_version,
                 traj.index_status.value,
                 traj.tenant_id or "lab",
+                int(getattr(traj, "schema_version", 4) or 4),
+                _dt_to_str(getattr(traj, "occurred_at", None)),
                 _dt_to_str(traj.updated_at),
                 _dt_to_str(traj.finalized_at),
                 traj.id,

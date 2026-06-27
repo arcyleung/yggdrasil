@@ -16,13 +16,11 @@ from yggdrasil.services.principal_context import get_principal
 
 AGENT_GUIDANCE = (
     "Yggdrasil org experience memory (not doc RAG). Before work that is uncertain to succeed or has "
-    "large research/setup overhead, call search_strategies (search_experience) to discover whether "
-    "other agents in the organization already tried similar goals—learn from their outcomes, effort, "
-    "and artifacts; always surface hit owner/agent_id/team so the user can follow up in person with "
-    "the people behind those trajectories. Write trajectories with external_refs "
-    "owner/agent_id/team/workspace and artifacts ({kind, path_or_url}) so others can find your work. "
-    "search_mode=lab for org/team discovery when owner is unknown; agent mode for strict gates. "
-    "get_trajectory for shortlisted depth; prefer low failure_waste_seconds."
+    "large research/setup overhead, call search_strategies (search_experience) with search_mode=lab "
+    "and limit>=20 for wide org recall. Response includes ranked[] and by_range (today/week/month/older) "
+    "sorted by success, recency, relevance—present as a table of people/agents/outcomes; always name "
+    "owners for human follow-up. Write trajectories with external_refs owner/agent_id/team/workspace "
+    "and artifacts. agent mode = stricter gates; get_trajectory on shortlisted ids only."
 )
 
 
@@ -128,17 +126,17 @@ def register_tools(mcp: Any, ctx: AppContext) -> None:
         status_in: list[str] | None = None,
         include_open: bool | None = None,
         tags_any: list[str] | None = None,
-        limit: int = 10,
+        limit: int = 25,
         effort_predicates: list[dict[str, Any]] | None = None,
         runtime_filters: dict[str, Any] | None = None,
-        prefer_low_waste: bool = False,
+        prefer_low_waste: bool = True,
         owner: str | None = None,
         agent_id: str | None = None,
         team: str | None = None,
         workspace: str | None = None,
         require_artifacts: bool | None = None,
         experience_grade_only: bool | None = None,
-        search_mode: str = "agent",
+        search_mode: str = "lab",
         include_archive: bool = False,
     ) -> dict[str, Any]:
         try:
@@ -163,7 +161,9 @@ def register_tools(mcp: Any, ctx: AppContext) -> None:
                 include_archive=include_archive,
                 principal=_tool_principal(ctx),
             )
-            payload = search_result(hits)
+            payload = search_result(
+                hits, query_task=task, prefer_low_waste=prefer_low_waste
+            )
             gate = ctx.search_service.last_gate_result
             if gate is not None:
                 payload["gate_warnings"] = list(gate.warnings)

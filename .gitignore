@@ -45,3 +45,4 @@ user_mapping.yaml
 data_auditing/reports/
 
 .ygg_ui_skill/
+data/*.db.bak.*

@@ -103,6 +103,8 @@ class SearchService:
             score=score,
             index_status=traj.index_status,
             embed_view_version=traj.embed_view_version,
+            updated_at=traj.updated_at,
+            finalized_at=traj.finalized_at,
         )
 
     @property
@@ -183,16 +185,21 @@ class SearchService:
 
         mode = (search_mode or "agent").strip().lower()
         if mode == "lab":
-            # Management / report agent: prefer authored experience, include team scope
+            # Org-wide discovery: do NOT restrict Qdrant to experience_grade-only by default
+            # (multi-lane imports + mixed tags); still gate archive tags post-retrieval.
             if experience_grade_only is None:
-                experience_grade_only = True
+                experience_grade_only = False
             if apply_gates is None:
                 apply_gates = True
             include_archive = include_archive or False
+            # Wider net for people/infra forensics ("who set up X?")
+            if fetch_limit_multiplier < 8:
+                fetch_limit_multiplier = 8
 
         use_gates = self._apply_gates_default if apply_gates is None else apply_gates
         # Over-fetch so gates can drop noisy/archive hits and still fill limit
         fetch_limit = limit * max(1, fetch_limit_multiplier) if use_gates else limit
+        fetch_limit = min(max(fetch_limit, limit), 80)
 
         vquery = VectorSearchQuery(
             task_vector=task_vector,
@@ -243,15 +250,16 @@ class SearchService:
 
         if use_gates:
             if mode == "lab":
-                # Lab forensics: don't exclude experience_grade; relax lexical gate slightly
+                # Lab forensics: wide recall — demote noise, don't require lexical overlap
                 gcfg = GateConfig(
                     exclude_tags_enabled=not include_archive,
                     exclude_tags=self._gate_config.exclude_tags,
                     reject_noisy_task=True,
+                    demote_noisy_instead_of_drop=True,
                     min_token_overlap=0.0,
                     require_overlap_if_no_shared_tokens=False,
                     respect_explicit_tags_any=self._gate_config.respect_explicit_tags_any,
-                    pass_through_if_all_filtered=False,
+                    pass_through_if_all_filtered=True,
                 )
             else:
                 gcfg = GateConfig(
@@ -275,19 +283,34 @@ class SearchService:
         else:
             self._last_gate_result = None
 
-        # Management / anti-duplication: surface low-waste successful paths first
-        if prefer_low_waste:
-            results = sorted(
-                results,
-                key=lambda h: (
-                    h.effort_totals.failure_waste_seconds
-                    if h.effort_totals.failure_waste_seconds is not None
-                    else float("inf"),
-                    h.effort_totals.wall_clock_seconds
-                    if h.effort_totals.wall_clock_seconds is not None
-                    else float("inf"),
-                    -(h.score or 0.0),
-                ),
+        # Default rank for org discovery: success, recency bucket, vector score (not only waste)
+        from yggdrasil.services.retrieval_gates import (
+            outcome_rank,
+            time_range_label,
+            token_overlap_score,
+        )
+
+        def _discovery_key(h: SearchHit) -> tuple:
+            status = None
+            if h.outcome is not None:
+                ts = getattr(h.outcome, "terminal_status", None)
+                status = ts.value if hasattr(ts, "value") else str(ts) if ts else None
+            status = status or (
+                h.status.value if hasattr(h.status, "value") else str(h.status)
             )
+            when = getattr(h, "updated_at", None) or getattr(h, "finalized_at", None)
+            rr = {"today": 4, "week": 3, "month": 2, "older": 1, "unknown": 0}.get(
+                time_range_label(when), 0
+            )
+            ov = token_overlap_score(task_q, h.task_text)
+            waste = (
+                h.effort_totals.failure_waste_seconds
+                if h.effort_totals is not None
+                else None
+            )
+            waste_pen = waste if (prefer_low_waste and waste is not None) else 0.0
+            return (outcome_rank(status), rr, float(h.score or 0.0), ov, -waste_pen)
+
+        results = sorted(results, key=_discovery_key, reverse=True)
 
         return results[:limit]
