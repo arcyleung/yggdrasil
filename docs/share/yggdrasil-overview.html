@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Yggdrasil — Org agent experience memory</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --bg2: #121a33;
+      --card: #151f3d;
+      --text: #e8eefc;
+      --muted: #9BB3D9;
+      --accent: #6ee7b7;
+      --accent2: #60a5fa;
+      --warn: #fbbf24;
+      --danger: #f87171;
+      --line: rgba(255,255,255,.08);
+      --shadow: 0 24px 80px rgba(0,0,0,.45);
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; height: 100%;
+      font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+      background: radial-gradient(1200px 600px at 10% -10%, #1a274d 0%, transparent 55%),
+                  radial-gradient(900px 500px at 100% 0%, #0f3d36 0%, transparent 45%),
+                  var(--bg);
+      color: var(--text);
+    }
+    .deck {
+      min-height: 100%;
+      display: flex;
+      flex-direction: column;
+      padding: 1.25rem 1.5rem 5.5rem;
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+    header.top {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 1rem; margin-bottom: 1rem; opacity: .9;
+    }
+    .brand { font-weight: 700; letter-spacing: .04em; font-size: .95rem; }
+    .brand span { color: var(--accent); }
+    .progress {
+      flex: 1; height: 4px; background: var(--line); border-radius: 99px; overflow: hidden;
+      max-width: 280px;
+    }
+    .progress > i {
+      display: block; height: 100%; width: 0%;
+      background: linear-gradient(90deg, var(--accent2), var(--accent));
+      transition: width .25s ease;
+    }
+    .counter { font-variant-numeric: tabular-nums; color: var(--muted); font-size: .85rem; min-width: 4.5rem; text-align: right; }
+
+    .stage {
+      flex: 1; display: grid; place-items: stretch;
+      position: relative;
+    }
+    .slide {
+      display: none;
+      animation: in .28s ease;
+      background: linear-gradient(160deg, rgba(255,255,255,.04), transparent 40%), var(--card);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      padding: 2rem 2.25rem 2.25rem;
+      min-height: min(70vh, 640px);
+    }
+    .slide.active { display: block; }
+    @keyframes in {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: none; }
+    }
+    .kicker {
+      display: inline-block; font-size: .72rem; text-transform: uppercase; letter-spacing: .12em;
+      color: var(--accent2); margin-bottom: .6rem; font-weight: 600;
+    }
+    h1 { font-size: clamp(1.6rem, 3.2vw, 2.35rem); line-height: 1.15; margin: 0 0 1rem; font-weight: 750; }
+    h2 { font-size: clamp(1.35rem, 2.6vw, 1.85rem); margin: 0 0 .9rem; line-height: 1.2; }
+    p, li { color: #c9d4f0; line-height: 1.55; font-size: 1.02rem; }
+    .lead { font-size: 1.12rem; color: var(--text); max-width: 52ch; }
+    ul { padding-left: 1.15rem; margin: .6rem 0 0; }
+    li { margin: .35rem 0; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem; }
+    @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } .slide { padding: 1.25rem; min-height: auto; } }
+    .tile {
+      background: rgba(0,0,0,.22); border: 1px solid var(--line); border-radius: 12px; padding: 1rem 1.1rem;
+    }
+    .tile h3 { margin: 0 0 .4rem; font-size: 1rem; color: var(--accent); }
+    .tile p { margin: 0; font-size: .95rem; }
+    table {
+      width: 100%; border-collapse: collapse; margin-top: 1rem; font-size: .92rem;
+    }
+    th, td {
+      text-align: left; padding: .55rem .65rem; border-bottom: 1px solid var(--line); vertical-align: top;
+    }
+    th { color: var(--muted); font-weight: 600; font-size: .75rem; text-transform: uppercase; letter-spacing: .06em; }
+    code, .mono {
+      font-family: ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+      font-size: .88em; color: #a5f3fc;
+    }
+    .arch {
+      display: grid; gap: .65rem; margin-top: 1rem;
+    }
+    .arch .row {
+      display: grid; grid-template-columns: 140px 1fr; gap: .75rem; align-items: stretch;
+    }
+    @media (max-width: 640px) { .arch .row { grid-template-columns: 1fr; } }
+    .pill {
+      background: rgba(96,165,250,.12); border: 1px solid rgba(96,165,250,.35);
+      border-radius: 10px; padding: .55rem .7rem; font-size: .82rem; font-weight: 600; color: #bfdbfe;
+      display: flex; align-items: center;
+    }
+    .flow {
+      background: rgba(0,0,0,.25); border-radius: 10px; padding: .65rem .8rem; font-size: .9rem; color: #c9d4f0;
+      border: 1px solid var(--line);
+    }
+    .tag {
+      display: inline-block; padding: .15rem .5rem; border-radius: 999px; font-size: .72rem;
+      background: rgba(110,231,183,.12); color: var(--accent); border: 1px solid rgba(110,231,183,.3);
+      margin-right: .25rem;
+    }
+    .footnote { margin-top: 1.25rem; font-size: .82rem; color: var(--muted); }
+
+    nav.controls {
+      position: fixed; left: 0; right: 0; bottom: 0;
+      display: flex; justify-content: center; gap: .75rem;
+      padding: .9rem 1rem 1.1rem;
+      background: linear-gradient(transparent, rgba(11,16,32,.92) 35%);
+      pointer-events: none;
+    }
+    nav.controls > * { pointer-events: auto; }
+    button {
+      appearance: none; border: 1px solid var(--line); background: #1a2444; color: var(--text);
+      border-radius: 999px; padding: .65rem 1.15rem; font-size: .95rem; font-weight: 600;
+      cursor: pointer; min-width: 7.5rem;
+    }
+    button:hover { border-color: rgba(110,231,183,.45); }
+    button:disabled { opacity: .35; cursor: not-allowed; }
+    button.primary {
+      background: linear-gradient(135deg, #0d9488, #2563eb); border: none;
+    }
+    .hint { align-self: center; color: var(--muted); font-size: .8rem; padding: 0 .5rem; }
+  </style>
+</head>
+<body>
+  <div class="deck">
+    <header class="top">
+      <div class="brand">YGGDRASIL <span>//</span> experience memory</div>
+      <div class="progress" aria-hidden="true"><i id="bar"></i></div>
+      <div class="counter" id="counter">1 / 1</div>
+    </header>
+
+    <div class="stage" id="stage">
+
+      <!-- 0 -->
+      <section class="slide active" data-title="Title">
+        <div class="kicker">Shareable overview</div>
+        <h1>Yggdrasil</h1>
+        <p class="lead">MCP-native, <strong>org-wide trajectory experience memory</strong> for autonomous agents—so fleets can reuse what was tried, what it cost, and <em>who</em> to talk to next.</p>
+        <p style="margin-top:1.25rem"><span class="tag">PoC</span><span class="tag">tenant: lab</span><span class="tag">not document RAG</span></p>
+        <p class="footnote">Single-file deck · ← / → or buttons · no network required after download</p>
+      </section>
+
+      <!-- 1 -->
+      <section class="slide" data-title="Motivation">
+        <div class="kicker">Motivation</div>
+        <h2>Agent fleets create context debt faster than humans can document</h2>
+        <div class="grid2">
+          <div class="tile">
+            <h3>What breaks today</h3>
+            <ul>
+              <li>Long-horizon agent work is mostly <strong>invisible</strong> after the chat ends</li>
+              <li>Wikis lag reality; nobody wants to maintain AI-generated docs</li>
+              <li>The next agent (or human) <strong>re-pays</strong> research, setup, and failure cost</li>
+              <li>Handoff is tribal: “ask Alex” with no searchable evidence</li>
+            </ul>
+          </div>
+          <div class="tile">
+            <h3>What we need instead</h3>
+            <ul>
+              <li>Memory of <strong>strategies executed</strong>, not just chat snippets or facts</li>
+              <li>Retrieval keyed by <strong>current task + scaffold</strong></li>
+              <li>Full traces on demand (steps, artifacts, effort)</li>
+              <li>First-class <strong>owner / agent_id</strong> for human follow-up</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- 2 -->
+      <section class="slide" data-title="Problem framing">
+        <div class="kicker">Problem framing</div>
+        <h2>Humans see ~20% of agent context at test time</h2>
+        <p class="lead">For audit and strategy—not just the final answer—you need the whole trajectory: paths, retries, tools, outcomes, waste.</p>
+        <ul>
+          <li><strong>Unit of memory:</strong> trajectory = task + scaffold + steps + progress + outcome + effort + artifacts</li>
+          <li><strong>Search key:</strong> embed only <em>current</em> task + scaffold (history lives in steps)</li>
+          <li><strong>Org scope:</strong> one lab retrieval plane; writes still bind to a real owner server-side</li>
+        </ul>
+      </section>
+
+      <!-- 3 -->
+      <section class="slide" data-title="Value">
+        <div class="kicker">Value</div>
+        <h2>Four bets that pay for the system</h2>
+        <div class="grid2">
+          <div class="tile"><h3>1. No doc maintenance burden</h3><p>Trajectories are the experiential source of truth—attested by execution, not a wiki someone was supposed to update.</p></div>
+          <div class="tile"><h3>2. Tombstone memoization</h3><p>Success <em>and</em> failure outcomes are cheap to consult, expensive to rediscover. High <code>failure_waste_seconds</code> is a warning, not a template.</p></div>
+          <div class="tile"><h3>3. Strategy-level understanding</h3><p>Search at strategy grain; <code>get_trajectory</code> for full method when shortlisted—not always-on transcript RAG.</p></div>
+          <div class="tile"><h3>4. Security &amp; management leverage</h3><p>Semantic search over what agents actually ran; staff by <strong>who has done this before</strong> (owner on every useful hit).</p></div>
+        </div>
+      </section>
+
+      <!-- 4 -->
+      <section class="slide" data-title="Differentiation">
+        <div class="kicker">Differentiation</div>
+        <h2>Not Mem0 / chat memory / doc RAG</h2>
+        <p>Those optimize “what does the agent know?” Yggdrasil optimizes <strong>“what strategies did we execute, at what cost, producing what, and who owns follow-up?”</strong></p>
+        <table>
+          <thead><tr><th>Theme</th><th>Typical memory / RAG</th><th>Yggdrasil</th></tr></thead>
+          <tbody>
+            <tr><td>Unit</td><td>Facts, chunks, messages</td><td><strong>Trajectories</strong></td></tr>
+            <tr><td>Search key</td><td>Passage embed</td><td><strong>Task + scaffold</strong> aspects</td></tr>
+            <tr><td>Org handoff</td><td>Often missing</td><td><code>owner</code> / <code>agent_id</code> / <code>team</code></td></tr>
+            <tr><td>Integration</td><td>App SDKs</td><td><strong>MCP-native</strong> (HTTP + stdio)</td></tr>
+            <tr><td>Reflex</td><td>Passive write</td><td><strong>Search first</strong> on uncertain / high-overhead work</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- 5 -->
+      <section class="slide" data-title="Agent loop">
+        <div class="kicker">How agents use it</div>
+        <h2>Skill + MCP tools as an org reflex</h2>
+        <div class="arch">
+          <div class="row"><div class="pill">1. Wire</div><div class="flow">Paste skill · Streamable HTTP MCP <code>…/mcp</code> with Bearer <code>ygg_…</code> (or stdio on data-plane host)</div></div>
+          <div class="row"><div class="pill">2. Search</div><div class="flow"><code>search_strategies</code> · <code>search_mode=lab</code> · limit ≥ 20 · current task + scaffold only · present <code>ranked[].at</code> + client time bins + <strong>owners</strong></div></div>
+          <div class="row"><div class="pill">3. Deepen</div><div class="flow"><code>get_trajectory</code> on 1–3 ids · read artifacts / workspace</div></div>
+          <div class="row"><div class="pill">4. Write</div><div class="flow"><code>start_trajectory</code> → <code>append_step</code> → <code>finalize_trajectory</code> (owner forced server-side) · segment multi-goal sessions</div></div>
+        </div>
+      </section>
+
+      <!-- 6 -->
+      <section class="slide" data-title="Architecture">
+        <div class="kicker">Architecture overview</div>
+        <h2>Control plane vs data plane</h2>
+        <div class="arch">
+          <div class="row"><div class="pill">Control plane</div><div class="flow">FastAPI UI · lab login · personalized <code>skill.md</code> / <code>mcp.json</code> · token exchange · Streamable HTTP MCP gateway · optional chat · often Tailscale / Funnel <code>/ygg</code></div></div>
+          <div class="row"><div class="pill">Data plane</div><div class="flow"><strong>SQLite SoT</strong> trajectories + steps · <strong>Qdrant</strong> multi-aspect vectors (<code>task</code> / <code>scaffold</code>) · embed endpoint · MCP tools enforce <code>Principal</code> (tenant, owner, scopes)</div></div>
+          <div class="row"><div class="pill">Ingress</div><div class="flow">Live agent writes via MCP · optional <strong>hydration</strong> from Mongo proxy logs → segment → embed (experience_grade vs archive gates)</div></div>
+          <div class="row"><div class="pill">Tenancy</div><div class="flow"><code>lab</code> = shared org retrieval · <code>demo</code> = external trial · mandatory <code>tenant_id</code> on vector search</div></div>
+        </div>
+      </section>
+
+      <!-- 7 -->
+      <section class="slide" data-title="Seams">
+        <div class="kicker">Architecture · seams</div>
+        <h2>Ports that matter when you scale</h2>
+        <div class="grid2">
+          <div class="tile"><h3>TrajectoryStore</h3><p>SQLite today → Postgres (or equivalent) for multi-replica SoT without rewriting MCP tools.</p></div>
+          <div class="tile"><h3>VectorIndex</h3><p>Qdrant client; tenant filter on every query; replica-safe point ids.</p></div>
+          <div class="tile"><h3>Embedder</h3><p>Task/scaffold aspects only; batch, timeouts, circuit breaker; async worker / outbox as N grows.</p></div>
+          <div class="tile"><h3>TokenStore + Principal</h3><p>Bearer <code>ygg_…</code> binds owner/tenant; writes cannot spoof attribution.</p></div>
+        </div>
+        <p class="footnote">Search path: Qdrant filter + vectors → hydrate trajectories from SoT by id (not full table scans).</p>
+      </section>
+
+      <!-- 8 -->
+      <section class="slide" data-title="Trust">
+        <div class="kicker">Retrieval trust</div>
+        <h2>Gates so “memory” is not archive noise</h2>
+        <ul>
+          <li><strong>agent</strong> mode (default): stricter strategy recall; exclude hydration/archive provenance tags</li>
+          <li><strong>lab</strong> mode: wide org forensics; prefers experience-grade memory—still does <em>not</em> launder archive trajectories</li>
+          <li>Empty gated results are OK: “no trusted prior experience”</li>
+          <li>Ranked table uses ISO event time <code>at</code>; agents bin today / week / month client-side (avoid embed-time <code>updated_at</code> false “today”)</li>
+        </ul>
+      </section>
+
+      <!-- 9 -->
+      <section class="slide" data-title="Operator path">
+        <div class="kicker">Rollout for the lab</div>
+        <h2>Humans don’t run the stack—they paste a skill</h2>
+        <ol style="color:#c9d4f0; line-height:1.55; padding-left:1.2rem;">
+          <li>Open control plane URL · lab login with mapped <code>sk-…</code> key</li>
+          <li>Download skill (MCP URL + bearer policies in one document)</li>
+          <li>Install skill in Codex / Cursor / Grok / … and point MCP client at host</li>
+          <li>Ask org questions: “who set up X?” → search → name owners → optional deep trajectory</li>
+        </ol>
+        <p class="footnote">Operators: <code>uvicorn yggdrasil.web.app</code> + Qdrant + embed + <code>user_mapping.yaml</code> · restart control plane after code changes (payload schema drift breaks search).</p>
+      </section>
+
+      <!-- 10 -->
+      <section class="slide" data-title="Close">
+        <div class="kicker">Takeaway</div>
+        <h2>Org experience memory, MCP-shaped</h2>
+        <p class="lead">Yggdrasil turns agent work into searchable strategies with attribution—so the lab stops rediscovering the same pain and starts compounding what already worked.</p>
+        <ul>
+          <li>Search before uncertain / high-overhead work</li>
+          <li>Surface <strong>owners</strong> for human follow-up</li>
+          <li>Write non-trivial runs; segment long sessions; finalize outcomes + effort</li>
+        </ul>
+        <p class="footnote">Repo: yggdrasil · Specs under <code>docs/superpowers/specs/</code> · Domain language in <code>CONTEXT.md</code></p>
+      </section>
+
+    </div>
+  </div>
+
+  <nav class="controls" aria-label="Slide navigation">
+    <button type="button" id="prev" aria-label="Previous slide">← Prev</button>
+    <span class="hint">← → · Space · Home/End</span>
+    <button type="button" id="next" class="primary" aria-label="Next slide">Next →</button>
+  </nav>
+
+  <script>
+    (function () {
+      const slides = Array.from(document.querySelectorAll(".slide"));
+      const bar = document.getElementById("bar");
+      const counter = document.getElementById("counter");
+      const prevBtn = document.getElementById("prev");
+      const nextBtn = document.getElementById("next");
+      let i = 0;
+
+      function show(n) {
+        i = Math.max(0, Math.min(slides.length - 1, n));
+        slides.forEach((s, idx) => s.classList.toggle("active", idx === i));
+        bar.style.width = ((i + 1) / slides.length * 100) + "%";
+        counter.textContent = (i + 1) + " / " + slides.length;
+        prevBtn.disabled = i === 0;
+        nextBtn.disabled = i === slides.length - 1;
+        document.title = "Yggdrasil — " + (slides[i].dataset.title || "Overview");
+        try { history.replaceState(null, "", "#" + (i + 1)); } catch (e) {}
+      }
+
+      function next() { show(i + 1); }
+      function prev() { show(i - 1); }
+
+      prevBtn.addEventListener("click", prev);
+      nextBtn.addEventListener("click", next);
+
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "ArrowRight" || e.key === " " || e.key === "PageDown") {
+          e.preventDefault(); next();
+        } else if (e.key === "ArrowLeft" || e.key === "PageUp") {
+          e.preventDefault(); prev();
+        } else if (e.key === "Home") { show(0); }
+        else if (e.key === "End") { show(slides.length - 1); }
+      });
+
+      let touchX = null;
+      document.addEventListener("touchstart", (e) => { touchX = e.changedTouches[0].screenX; }, { passive: true });
+      document.addEventListener("touchend", (e) => {
+        if (touchX == null) return;
+        const dx = e.changedTouches[0].screenX - touchX;
+        if (Math.abs(dx) > 50) (dx < 0 ? next : prev)();
+        touchX = null;
+      }, { passive: true });
+
+      const hash = parseInt((location.hash || "").replace("#", ""), 10);
+      show(Number.isFinite(hash) && hash > 0 ? hash - 1 : 0);
+    })();
+  </script>
+</body>
+</html>

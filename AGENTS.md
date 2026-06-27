@@ -33,3 +33,6 @@ For **architecture / scaling** work prefer:
 | `triage` | Label GitHub issues for AFK agents |
 
 Clone source: https://github.com/mattpocock/skills.git (see `~/.grok/skills/mattpocock/SOURCE.txt`).
+
+## Liza skills
+Installed under `~/.grok/skills/liza/` from https://github.com/liza-mas/liza (code-review, GUARDRAILS, operator posture).

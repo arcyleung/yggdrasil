@@ -17,10 +17,12 @@ from yggdrasil.services.principal_context import get_principal
 AGENT_GUIDANCE = (
     "Yggdrasil org experience memory (not doc RAG). Before work that is uncertain to succeed or has "
     "large research/setup overhead, call search_strategies (search_experience) with search_mode=lab "
-    "and limit>=20 for wide org recall. Response includes ranked[] and by_range (today/week/month/older) "
-    "sorted by success, recency, relevance—present as a table of people/agents/outcomes; always name "
-    "owners for human follow-up. Write trajectories with external_refs owner/agent_id/team/workspace "
-    "and artifacts. agent mode = stricter gates; get_trajectory on shortlisted ids only."
+    "and limit>=20 for wide org recall. Response ranked[] rows include ISO datestamp `at` (experience "
+    "event time)—bin client-side into today/week/month/older/unknown; do not expect server `range` or "
+    "by_range. Sort is success, event-time recency, relevance. Present people/agents/outcomes table; "
+    "always name owners for human follow-up. Write trajectories with external_refs "
+    "owner/agent_id/team/workspace and artifacts. agent mode = stricter gates; get_trajectory on "
+    "shortlisted ids only."
 )
 
 

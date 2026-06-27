@@ -283,10 +283,11 @@ class SearchService:
         else:
             self._last_gate_result = None
 
-        # Default rank for org discovery: success, recency bucket, vector score (not only waste)
+        # Default rank for org discovery: success, event-time recency, vector score (not only waste)
         from yggdrasil.services.retrieval_gates import (
+            _as_utc_datetime,
+            experience_event_time,
             outcome_rank,
-            time_range_label,
             token_overlap_score,
         )
 
@@ -298,10 +299,8 @@ class SearchService:
             status = status or (
                 h.status.value if hasattr(h.status, "value") else str(h.status)
             )
-            when = getattr(h, "updated_at", None) or getattr(h, "finalized_at", None)
-            rr = {"today": 4, "week": 3, "month": 2, "older": 1, "unknown": 0}.get(
-                time_range_label(when), 0
-            )
+            when_dt = _as_utc_datetime(experience_event_time(h))
+            recency_epoch = when_dt.timestamp() if when_dt is not None else 0.0
             ov = token_overlap_score(task_q, h.task_text)
             waste = (
                 h.effort_totals.failure_waste_seconds
@@ -309,7 +308,13 @@ class SearchService:
                 else None
             )
             waste_pen = waste if (prefer_low_waste and waste is not None) else 0.0
-            return (outcome_rank(status), rr, float(h.score or 0.0), ov, -waste_pen)
+            return (
+                outcome_rank(status),
+                recency_epoch,
+                float(h.score or 0.0),
+                ov,
+                -waste_pen,
+            )
 
         results = sorted(results, key=_discovery_key, reverse=True)
 

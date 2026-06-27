@@ -129,23 +129,44 @@ def hit_claims_experience_grade(hit: SearchHit) -> bool:
     return bool(refs.get("experience_grade") or refs.get("multilane_policy"))
 
 
-def time_range_label(when: Any) -> str:
-    """Bucket a datetime (or ISO string) into today | week | month | older | unknown."""
-    from datetime import datetime, timedelta, timezone
+def _as_utc_datetime(when: Any) -> datetime | None:
+    """Parse datetime or ISO string to aware UTC; None if unusable."""
+    from datetime import datetime, timezone
 
     if when is None:
-        return "unknown"
+        return None
     if isinstance(when, str):
         try:
             when = datetime.fromisoformat(when.replace("Z", "+00:00"))
         except ValueError:
-            return "unknown"
+            return None
     if not isinstance(when, datetime):
-        return "unknown"
+        return None
     if when.tzinfo is None:
         when = when.replace(tzinfo=timezone.utc)
+    return when.astimezone(timezone.utc)
+
+
+def iso_timestamp(when: Any) -> str | None:
+    """Serialize event time as ISO-8601 UTC (…Z) for agents; None if unknown."""
+    dt = _as_utc_datetime(when)
+    if dt is None:
+        return None
+    return dt.isoformat().replace("+00:00", "Z")
+
+
+def time_range_label(when: Any) -> str:
+    """Bucket a datetime (or ISO string) into today | week | month | older | unknown.
+
+    Prefer client-side binning from ranked[].at; kept for tests / optional UI.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    dt = _as_utc_datetime(when)
+    if dt is None:
+        return "unknown"
     now = datetime.now(timezone.utc)
-    age = now - when
+    age = now - dt
     if age <= timedelta(days=1):
         return "today"
     if age <= timedelta(days=7):
@@ -153,6 +174,28 @@ def time_range_label(when: Any) -> str:
     if age <= timedelta(days=30):
         return "month"
     return "older"
+
+
+def experience_event_time(hit: SearchHit) -> Any:
+    """Best-effort *experience* timestamp (when work happened), not re-index mtime.
+
+    Prefer finalized_at (session close / outcome), then external occurred_at / created_at,
+    then trajectory created hints in refs. Avoid updated_at alone — importers often
+    stamp it at embed time so everything looks like \"today\".
+    """
+    refs = hit.external_refs or {}
+    for candidate in (
+        hit.finalized_at,
+        refs.get("occurred_at"),
+        refs.get("finalized_at"),
+        refs.get("created_at"),
+        refs.get("session_ended_at"),
+        refs.get("ended_at"),
+    ):
+        if candidate is not None:
+            return candidate
+    # Last resort: updated_at (index / row mtime)
+    return hit.updated_at or refs.get("updated_at")
 
 
 def outcome_rank(status: str | None) -> int:
@@ -176,21 +219,27 @@ def rank_experience_hits(
     prefer_low_waste: bool = True,
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Rank hits for org discovery: recency, success, relevance (score + token overlap).
+    """Rank hits for org discovery: success, event-time recency, relevance, low waste.
 
-    Returns structured rows suitable for agent tables / time-bucket presentation.
+    Each row carries ISO datestamp ``at`` (experience event time). Agents bin into
+    today / this week / this month / older / unknown using their clock — do not
+    rely on a server ``range`` label (re-index ``updated_at`` used to mis-bin all hits
+    as \"today\").
     """
     from datetime import datetime, timezone
 
     rows: list[dict[str, Any]] = []
+    now = datetime.now(timezone.utc)
     for h in hits:
         refs = h.external_refs or {}
         owner = h.owner or refs.get("owner") or "unknown"
         agent_id = h.agent_id or refs.get("agent_id")
         team = h.team or refs.get("team")
-        when = h.updated_at or h.finalized_at
-        if when is None:
-            when = refs.get("updated_at") or refs.get("finalized_at")
+        when = experience_event_time(h)
+        when_dt = _as_utc_datetime(when)
+        at_iso = iso_timestamp(when)
+        # Index/row mtime (often embed time) — separate from experience event time
+        indexed_iso = iso_timestamp(h.updated_at) or iso_timestamp(refs.get("updated_at"))
         status = None
         if h.outcome is not None:
             ts = getattr(h.outcome, "terminal_status", None)
@@ -201,16 +250,15 @@ def rank_experience_hits(
         waste = None
         if h.effort_totals is not None:
             waste = h.effort_totals.failure_waste_seconds
-        # Composite: success tier, recency (newer = smaller age key), relevance, low waste
-        range_label = time_range_label(when)
-        range_rank = {"today": 4, "week": 3, "month": 2, "older": 1, "unknown": 0}.get(
-            range_label, 0
-        )
+        # Recency key: epoch seconds (newer = larger) for sort; unknown → 0
+        recency_epoch = when_dt.timestamp() if when_dt is not None else 0.0
         waste_key = waste if waste is not None else (0.0 if prefer_low_waste else 0.0)
-        # For prefer_low_waste, lower waste is better → negate later in sort
         rows.append(
             {
-                "range": range_label,
+                # Primary datestamp for agent tables / client-side range bins
+                "at": at_iso,
+                "occurred_at": at_iso,
+                "indexed_at": indexed_iso,
                 "owner": owner,
                 "agent_id": agent_id,
                 "team": team,
@@ -226,12 +274,11 @@ def rank_experience_hits(
                 "relevance_score": score,
                 "token_overlap": round(overlap, 4),
                 "failure_waste_seconds": waste,
-                "updated_at": when.isoformat()
-                if isinstance(when, datetime)
-                else (str(when) if when else None),
+                "updated_at": indexed_iso,
+                "finalized_at": iso_timestamp(h.finalized_at),
                 "_sort": (
                     outcome_rank(status),
-                    range_rank,
+                    recency_epoch,
                     score,
                     overlap,
                     -(waste_key if prefer_low_waste and waste_key is not None else 0.0),
@@ -246,8 +293,15 @@ def rank_experience_hits(
     return rows
 
 
-def group_ranked_by_range(ranked: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """Group ranked rows into today / week / month / older / unknown lists (order preserved)."""
+def group_ranked_by_range(
+    ranked: list[dict[str, Any]],
+    *,
+    now: Any = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Optional client-style bins from ranked[].at (for tests/UI). MCP no longer returns this.
+
+    Prefer implementing the same bins in the agent skill from ISO ``at`` timestamps.
+    """
     out: dict[str, list[dict[str, Any]]] = {
         "today": [],
         "week": [],
@@ -256,7 +310,8 @@ def group_ranked_by_range(ranked: list[dict[str, Any]]) -> dict[str, list[dict[s
         "unknown": [],
     }
     for r in ranked:
-        key = r.get("range") or "unknown"
+        when = r.get("at") or r.get("occurred_at") or r.get("range")
+        key = time_range_label(when)
         if key not in out:
             key = "unknown"
         out[key].append(r)

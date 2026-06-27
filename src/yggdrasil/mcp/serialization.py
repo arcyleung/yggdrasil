@@ -49,7 +49,7 @@ def search_result(
     query_task: str | None = None,
     prefer_low_waste: bool = True,
 ) -> dict[str, Any]:
-    from yggdrasil.services.retrieval_gates import group_ranked_by_range, rank_experience_hits
+    from yggdrasil.services.retrieval_gates import rank_experience_hits
 
     ranked = rank_experience_hits(
         hits, query_task=query_task, prefer_low_waste=prefer_low_waste
@@ -57,17 +57,31 @@ def search_result(
     return {
         "hits": [search_hit_to_dict(h) for h in hits],
         "count": len(hits),
-        # Agent-facing structured table (recency × success × relevance)
+        # Agent-facing structured table (success × event-time recency × relevance)
         "ranked": ranked,
-        "by_range": group_ranked_by_range(ranked),
         "presentation": {
-            "format": "experience_table_v1",
-            "rank_order": ["outcome_success", "recency", "relevance_score", "low_waste"],
-            "ranges": ["today", "week", "month", "older", "unknown"],
+            "format": "experience_table_v2",
+            "rank_order": [
+                "outcome_success",
+                "event_time_recency",
+                "relevance_score",
+                "low_waste",
+            ],
+            "timestamp_field": "at",
+            "timestamp_semantics": (
+                "ISO-8601 UTC experience event time (prefer finalized_at / occurred_at; "
+                "not re-index updated_at). Bin client-side relative to agent clock."
+            ),
+            "client_range_bins": ["today", "week", "month", "older", "unknown"],
+            "client_range_rules": (
+                "today: age <= 1d; week: <= 7d; month: <= 30d; else older; missing at → unknown"
+            ),
             "agent_instruction": (
-                "Present ranked[] as a markdown table (range | owner | agent_id | outcome | "
-                "trajectory_id | task preview | score). Prefer by_range buckets when the user "
-                "asks time-based questions. Always name owners for human follow-up."
+                "Present ranked[] as a markdown table: at (ISO) | client_range | owner | "
+                "agent_id | outcome | trajectory_id | task preview | score. Compute "
+                "client_range from ranked[].at vs now (today/week/month/older/unknown). "
+                "Do not expect server-side range or by_range. Always name owners for "
+                "human follow-up."
             ),
         },
     }
